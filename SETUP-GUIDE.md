@@ -1,52 +1,123 @@
-# Context Engine — Setup Guide (krok po kroku)
+---
+name: Context Engine — Interactive Setup Guide for Claude
+description: Master setup script that Claude Code follows to walk a Bootcamp member through end-to-end installation, configuration, deployment (local or Railway+OAuth), and first-run population of their Context Engine.
+type: setup-guide
+audience: claude-code
+language: sk
+version: 2.0
+---
 
-Tento dokument je návod pre Claude aj pre teba. Keď ho Claude načíta, prevedie ťa celým procesom od nuly po funkčný Context Engine.
+# Context Engine — Interactive Setup Guide (pre Claude)
 
-Povie ti presne čo máš urobiť, a väčšinu práce urobí sám.
+> **Tento dokument je inštruktážny script pre teba (Claude Code).** Používateľ ti dal prompt typu „nainštaluj mi Context Engine". Tvoja úloha je previesť ho **krok za krokom** od nuly po funkčný MCP endpoint, na ktorý sa pripojí z Claude Code / Cowork / iného agenta. Hovor po slovensky, tykaj, buď proaktívny, nečakaj kým sa pýta.
 
 ---
 
-## FÁZA 0: Prvý kontakt s Claude (2 minúty)
+## Kontext a princípy
 
-Keď máš folder `context-engine-produkt` na disku, otvor ho v Claude Code alebo v Cowork:
+**Kto je používateľ:** Člen Claude Bootcampu. Podnikateľ, **nie programátor**. Vie spustiť terminál a klikať. Neočakávaj že rozumie Pythonu, Dockeru, MCP, OAuth alebo Railway. Vysvetľuj len keď treba a v ľudskej reči.
 
-**Claude Code:**
+**Cieľ:** Na konci sessionu má používateľ:
+1. Nainštalovaný Context Engine (lokálne **alebo** na Railway s OAuth)
+2. Inicializovanú DB a funkčné `ctx_*` tooly v Claude
+3. Prvé záznamy: seba, svoju firmu, 3–5 pravidiel komunikácie, kľúčových ľudí
+4. Sanity-tested retrieval (`ctx_stats`, `ctx_context`, `ctx_find`)
+
+**Tvoja DNA:**
+- ✅ **Plug & play** — všetko rieš za neho. Spúšťaj príkazy, edituj súbory, riešiš chyby. Pýtaj sa len pri nevratných/platených akciách (GitHub/Railway účet, volume, OAuth secret, `--force` akcie).
+- ✅ **Discovery najprv, potom akcia** — nasleduj fázy v poradí.
+- ✅ **Jeden krok naraz** — neukazuj 10 príkazov naraz. Spusti, počkaj, vysvetli, ďalej.
+- ✅ **Vždy povedz prečo** — v 1 vete pred každým krokom prečo to robíš.
+- ❌ **Nikdy nevypisuj long-form teóriu** ak sa nepýta. Toto je inštalátor, nie kurz.
+- ❌ **Nenechávaj ho čítať dokumentáciu** — TY si prečítaj všetko a zhrň mu len to podstatné.
+- ❌ **Nikdy ho nepošli stiahnuť installer z webu**, ak sa to dá vyriešiť príkazom cez `brew` / `winget` / `apt`.
+
+---
+
+## FÁZA 0: Privítanie + environment check + auto-install nástrojov
+
+Hneď ako prečítaš tento súbor, povedz:
+
+> „Ahoj 👋 Som tvoj inštalátor Context Engine. Za 15-40 minút ti rozbehnem štruktúrovanú pamäť pre Claude — bude vedieť kto je kto, ako s kým hovoríš, a bude si pamätať všetko dôležité. Začnem krátkym skenom prostredia, nech viem čo už máš a čo ti doinštalujem."
+
+### 0.1 — Detekuj OS a stav prostredia
+
+Spusti **paralelne**:
+- `uname -s` (Mac → "Darwin", Linux → "Linux", Windows → zlyhá)
+- `pwd`
+- `ls -la`
+- `python3 --version` (musí byť ≥ 3.10)
+- `git --version`
+
+**Zapamätaj si OS** (macOS / Windows / Linux). Použiješ ho ďalej.
+
+### 0.2 — Inštalácia chýbajúcich nástrojov
+
+> **PRAVIDLO:** nikdy ho nepošli stiahnuť installer z webu, ak sa to dá príkazom.
+
+#### macOS
+
+**git** (ak chýba): `xcode-select --install` — vyskočí GUI popup, povedz mu: *„Vyskočil ti systémový popup, klikni 'Install' a počkaj 5-10 minút."* Over `git --version` v slučke.
+
+**python3 ≥ 3.10** (ak chýba alebo je starší):
+1. Skontroluj `brew --version`
+2. **Ak má Homebrew** → `brew install python@3.12`
+3. **Ak nemá Homebrew** → potrebuje ho najprv. Homebrew install script vyžaduje sudo, čo Bash tool neutiahne interaktívne. Povedz mu:
+
+   > „Aby som ti vedel nainštalovať Python, potrebujeme jednorázovo Homebrew (balíčkový manažér pre Mac, bezpečný a oficiálny). Prosím:
+   > 1. Otvor aplikáciu **Terminal** (`Cmd+Space` → `Terminal` → Enter)
+   > 2. Vlep tento jeden riadok a stlač Enter:
+   >
+   > ```
+   > /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   > ```
+   >
+   > Bude si pýtať heslo k Macu (rovnaké ako login). Povedz mi keď bude hotovo."
+
+   Keď potvrdí → `brew --version` → `brew install python@3.12`.
+
+#### Windows
+
+- **git:** `winget install --id Git.Git -e --source winget`
+- **python:** `winget install --id Python.Python.3.12 -e --source winget`
+- Po inštalácii môže byť treba zavrieť a otvoriť Claude Code (PATH refresh). Povedz mu.
+- Ak `winget` nefunguje (starý Windows), navrhni Chocolatey.
+
+#### Linux
+
+Použi balíčkový manažér distribúcie: `apt install python3 python3-pip git` / `dnf install …` / `pacman -S …`.
+
+### 0.3 — Stiahni repo (ak v zložke ešte nie je)
+
+Skontroluj `ls -la` — ak nevidíš `pyproject.toml` a `src/context_engine/`, spusti:
+
 ```bash
-cd ~/context-engine
-claude
+git clone https://github.com/jarosatori/context-engine-community.git .
 ```
 
-**Cowork:**
-Otvor Cowork → vyber folder `context-engine` cez "Select folder"
+(Bodka na konci = do aktuálnej zložky.)
 
-### Čo povedať Claude — prvý prompt
-
-Skopíruj toto a vlož do Claude:
-
-```
-Prečítaj si súbor SETUP-GUIDE.md a skill-onboarding/SKILL.md v tomto foldri.
-Potom ma preveď kompletným setupom Context Engine krok po kroku.
-
-Začni FÁZOU 0.5 — opýtaj sa ma, či chcem inštaláciu lokálne na PC
-alebo deployment na Railway s OAuth. Vysvetli mi rozdiely a pomôž
-mi vybrať podľa môjho use-casu (počet zariadení, technická zručnosť,
-ochota platiť ~5 USD/mesiac).
-
-Potom pokračuj príslušnou cestou (FÁZA 1A alebo FÁZA 1B).
-```
-
-Claude si prečíta inštrukcie a začne ťa navigovať. Nemusíš vedieť nič technické — Claude ti povie čo máš urobiť, a väčšinu práce urobí sám.
-
-### Alternatívny prompt (ak už máš MCP pripojený)
-
-```
-Prečítaj si skill/SKILL.md a nastav mi Context Engine.
-Pridaj ma, moju firmu a moje pravidlá komunikácie.
-```
+Ak už repo **je** stiahnuté (napr. user si urobil `git clone` sám cestou B), preskoč a choď na FÁZU 0.5.
 
 ---
 
-## FÁZA 0.5: Vyber si kde to bude bežať
+## FÁZA 0.5: Discovery — use-case a výber deployment cesty
+
+Pred akoukoľvek inštaláciou potrebuješ vedieť **na čo** Context Engine bude a **kde** pobeží. Spýtaj sa používateľa (jeden quick rozhovor, nie dlhý dotazník):
+
+**Otázka 1 — use-case (1 veta odpoveď stačí):**
+> „Na čo ideš Context Engine používať? Solopreneur workflow (ja + moji ľudia + moje pravidlá)? Firma s tímom? Content creator (zdroje + spolupracovníci)? Consultant (klienti + projekty)? Niečo iné?"
+
+Podľa odpovede si poznač:
+- Ktoré **domains** budú aktívne (`work`, `personal`, `home`, `health`, `finance`, `family`, `education`)
+- Aké **rules** pravdepodobne chce (tykanie/vykanie, formálny/neformálny, jazyk)
+- Či chce **import** z existujúcich zdrojov (Asana projekty, Google Contacts, CLAUDE.md pravidlá)
+
+**Otázka 2 — deployment:** prečítaj mu zhrnutie dvoch ciest (A lokál / B Railway) nižšie a pomôž mu vybrať. Ak má **jeden PC a chce to len skúsiť** → A. Ak chce **zdieľanú DB medzi Claude Code + Cowork + agentom / mobilom / druhým PC** → B.
+
+---
+
+## FÁZA 0.5 detail: Vyber si kde to bude bežať
 
 Context Engine môžeš spustiť **dvomi spôsobmi**. Vyber si podľa svojich potrieb:
 
@@ -121,7 +192,7 @@ Potrebuješ Python 3.10 alebo novší. Ak nemáš, nainštaluj cez:
 
 ### Krok 1.2 — Stiahni Context Engine
 
-Skopíruj folder `context-engine-produkt` niekam na disk. Odporúčanie:
+Skopíruj folder `context-engine-community` niekam na disk. Odporúčanie:
 ```bash
 # Mac/Linux
 ~/context-engine/
