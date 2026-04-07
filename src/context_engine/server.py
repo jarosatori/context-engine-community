@@ -1,0 +1,473 @@
+"""Context Engine — MCP Server.
+
+Strukturovana kontextova pamat pre zivot. Udrzuje databazu ludi, firiem,
+projektov, produktov, pravidiel, interakcii a poznamok.
+"""
+
+import os
+import sys
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Simple health endpoint for Railway healthcheck."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def log_message(self, *args):
+        pass  # suppress logs
+
+from context_engine import db
+from context_engine.models import (
+    PersonInput, CompanyInput, ProjectInput, ProductInput,
+    RuleInput, InteractionInput, NoteInput, UpdateInput,
+)
+
+
+def _create_mcp():
+    """Create FastMCP instance, with OAuth if configured."""
+    oauth_url = os.environ.get("CTX_OAUTH_URL")  # e.g. http://localhost:9000
+
+    if oauth_url:
+        from mcp.server.auth.settings import AuthSettings
+        from mcp_oauth import IntrospectionTokenVerifier
+        from pydantic import AnyHttpUrl
+
+        server_url = os.environ.get("CTX_SERVER_URL", "http://localhost:8000")
+        token_verifier = IntrospectionTokenVerifier(
+            introspection_endpoint=f"{oauth_url}/introspect",
+            server_url=server_url,
+            validate_resource=False,
+        )
+        return FastMCP(
+            "Context Engine",
+            instructions="Strukturovana kontextova pamat — ludia, firmy, projekty, pravidla, poznamky. Life OS.",
+            token_verifier=token_verifier,
+            auth=AuthSettings(
+                issuer_url=AnyHttpUrl(oauth_url),
+                required_scopes=["user"],
+                resource_server_url=AnyHttpUrl(f"{server_url}/Context Engine"),
+            ),
+        )
+    else:
+        return FastMCP(
+            "Context Engine",
+            instructions="Strukturovana kontextova pamat — ludia, firmy, projekty, pravidla, poznamky. Life OS.",
+        )
+
+
+mcp = _create_mcp()
+
+
+# --- Initialization ---
+
+@mcp.tool()
+def ctx_init() -> dict:
+    """Inicializuj databazu. Bezpecne spustit opakovane."""
+    return db.init_db()
+
+
+@mcp.tool()
+def ctx_populate_aliases() -> dict:
+    """Jednorazova migracia: vygeneruj aliasy (prezyvky) pre vsetkych ludi z NICKNAMES dictionary.
+    Bezpecne spustit opakovane — merguje s existujucimi aliasmi."""
+    return db.populate_aliases()
+
+
+# --- Search ---
+
+@mcp.tool()
+def ctx_find(query: str, domain: str | None = None) -> dict:
+    """Hladaj napriec celou DB (ludia, firmy, projekty, produkty, pravidla, poznamky).
+    Volitelne filtruj podla domeny (work, personal, home, health, finance, family, education)."""
+    return db.find(query, domain)
+
+
+# --- Detail views ---
+
+@mcp.tool()
+def ctx_person(query: str) -> dict:
+    """Detail osoby — udaje, interakcie, projekty, pravidla.
+    Hladaj podla mena, emailu, prezyvky alebo aliasu. Podporuje fuzzy matching priezvisk."""
+    return db.get_person(query)
+
+
+@mcp.tool()
+def ctx_company(query: str) -> dict:
+    """Detail firmy — ludia, projekty, produkty, pravidla."""
+    return db.get_company(query)
+
+
+@mcp.tool()
+def ctx_project(query: str) -> dict:
+    """Detail projektu — popis, tim, status."""
+    return db.get_project(query)
+
+
+@mcp.tool()
+def ctx_context(query: str) -> dict:
+    """Plny komunikacny kontext pre osobu. Pouzi VZDY pred pisanim emailu/spravy.
+    Vrati: formality, ton, jazyk, firma, posledne interakcie, pravidla."""
+    return db.context_for(query)
+
+
+# --- Add records ---
+
+@mcp.tool()
+def ctx_add_person(
+    name: str,
+    email: str | None = None,
+    phone: str | None = None,
+    company_id: int | None = None,
+    company_name: str | None = None,
+    role: str | None = None,
+    relationship: str | None = None,
+    formality: str = "uncertain",
+    tone: str | None = None,
+    language: str = "sk",
+    projects: str | None = None,
+    notes: str | None = None,
+    status: str = "active",
+    source: str | None = None,
+    domain: str = "work",
+) -> dict:
+    """Pridaj osobu do registra.
+    formality: ty/vy/uncertain. tone: formalny/priatelsky/vecny/neformlny.
+    domain: work/personal/home/health/finance/family/education."""
+    data = PersonInput(
+        name=name, email=email, phone=phone, company_id=company_id,
+        company_name=company_name, role=role, relationship=relationship,
+        formality=formality, tone=tone, language=language, projects=projects,
+        notes=notes, status=status, source=source, domain=domain,
+    )
+    return db.add_record("people", data.model_dump(exclude_none=True))
+
+
+@mcp.tool()
+def ctx_add_company(
+    name: str,
+    type: str | None = None,
+    industry: str | None = None,
+    my_role: str | None = None,
+    website: str | None = None,
+    notes: str | None = None,
+    status: str = "active",
+    domain: str = "work",
+) -> dict:
+    """Pridaj firmu. type: vlastna/klient/partner/vendor/ina."""
+    data = CompanyInput(
+        name=name, type=type, industry=industry, my_role=my_role,
+        website=website, notes=notes, status=status, domain=domain,
+    )
+    return db.add_record("companies", data.model_dump(exclude_none=True))
+
+
+@mcp.tool()
+def ctx_add_project(
+    name: str,
+    company_id: int | None = None,
+    company_name: str | None = None,
+    description: str | None = None,
+    type: str | None = None,
+    status: str = "active",
+    team: str | None = None,
+    my_role: str | None = None,
+    asana_id: str | None = None,
+    slack_channel: str | None = None,
+    drive_folder: str | None = None,
+    key_contacts: str | None = None,
+    notes: str | None = None,
+    deadline: str | None = None,
+    domain: str = "work",
+) -> dict:
+    """Pridaj projekt. team a key_contacts su JSON arrays."""
+    data = ProjectInput(
+        name=name, company_id=company_id, company_name=company_name,
+        description=description, type=type, status=status, team=team,
+        my_role=my_role, asana_id=asana_id, slack_channel=slack_channel,
+        drive_folder=drive_folder, key_contacts=key_contacts, notes=notes,
+        deadline=deadline, domain=domain,
+    )
+    return db.add_record("projects", data.model_dump(exclude_none=True))
+
+
+@mcp.tool()
+def ctx_add_product(
+    name: str,
+    company_id: int | None = None,
+    company_name: str | None = None,
+    description: str | None = None,
+    price: str | None = None,
+    format: str | None = None,
+    availability: str | None = None,
+    target_audience: str | None = None,
+    min_criteria: str | None = None,
+    notes: str | None = None,
+    status: str = "active",
+    domain: str = "work",
+) -> dict:
+    """Pridaj produkt/sluzbu. format: fyzicky/digitalny/sluzba/saas."""
+    data = ProductInput(
+        name=name, company_id=company_id, company_name=company_name,
+        description=description, price=price, format=format,
+        availability=availability, target_audience=target_audience,
+        min_criteria=min_criteria, notes=notes, status=status, domain=domain,
+    )
+    return db.add_record("products", data.model_dump(exclude_none=True))
+
+
+@mcp.tool()
+def ctx_add_rule(
+    context: str,
+    rule: str,
+    example: str | None = None,
+    priority: str = "medium",
+    category: str | None = None,
+    applies_to: str | None = None,
+    notes: str | None = None,
+    status: str = "active",
+    domain: str = "work",
+) -> dict:
+    """Pridaj pravidlo. priority: high/medium/low. applies_to je JSON array mien."""
+    data = RuleInput(
+        context=context, rule=rule, example=example, priority=priority,
+        category=category, applies_to=applies_to, notes=notes,
+        status=status, domain=domain,
+    )
+    return db.add_record("rules", data.model_dump(exclude_none=True))
+
+
+@mcp.tool()
+def ctx_add_note(
+    title: str,
+    content: str | None = None,
+    domain: str = "personal",
+    category: str | None = None,
+    tags: str | None = None,
+    related_person_id: int | None = None,
+    related_project_id: int | None = None,
+    source: str | None = None,
+    status: str = "active",
+) -> dict:
+    """Pridaj poznamku/znalost do znalostnej bazy.
+    Pouzi pre vsetko co nema vlastnu tabulku — recepty, hesla, referencie, napady, zdravotne zaznamy.
+    domain: personal/home/health/finance/family/education/work.
+    category: health, finance, recipe, idea, reference, alebo lubovolny text."""
+    data = NoteInput(
+        title=title, content=content, domain=domain, category=category,
+        tags=tags, related_person_id=related_person_id,
+        related_project_id=related_project_id, source=source, status=status,
+    )
+    return db.add_note(data.model_dump(exclude_none=True))
+
+
+@mcp.tool()
+def ctx_find_notes(
+    query: str,
+    domain: str | None = None,
+    category: str | None = None,
+) -> dict:
+    """Hladaj v poznnamkach/znalostnej baze. Volitelne filtruj podla domeny a kategorie."""
+    return db.find_notes(query, domain, category)
+
+
+# --- Update ---
+
+@mcp.tool()
+def ctx_update(table: str, record_id: int, data: dict) -> dict:
+    """Aktualizuj existujuci zaznam. table: people/companies/projects/products/rules/notes.
+    data: dict s poliami na zmenu, napr. {"role": "CTO", "notes": "povyseny"}."""
+    return db.update_record(table, record_id, data)
+
+
+# --- Interactions ---
+
+@mcp.tool()
+def ctx_log(
+    person_id: int | None = None,
+    person_name: str | None = None,
+    channel: str | None = None,
+    direction: str | None = None,
+    summary: str | None = None,
+    context: str | None = None,
+    date: str | None = None,
+    source_ref: str | None = None,
+    domain: str = "work",
+) -> dict:
+    """Zaloguj interakciu (email, call, meeting...).
+    channel: email/slack/asana/call/meeting/sms. direction: incoming/outgoing/both."""
+    data = InteractionInput(
+        person_id=person_id, person_name=person_name, channel=channel,
+        direction=direction, summary=summary, context=context,
+        date=date, source_ref=source_ref, domain=domain,
+    )
+    return db.log_interaction(data.model_dump(exclude_none=True))
+
+
+# --- Statistics & maintenance ---
+
+@mcp.tool()
+def ctx_stats(domain: str | None = None) -> dict:
+    """Statistiky registra. Bez domeny = celkove + breakdown per domain."""
+    return db.stats(domain)
+
+
+@mcp.tool()
+def ctx_incomplete(domain: str | None = None) -> dict:
+    """Zaznamy na doplnenie — to_verify, chybajuce emaily, uncertain formality."""
+    return db.incomplete(domain)
+
+
+@mcp.tool()
+def ctx_stale(days: int = 30, domain: str | None = None) -> dict:
+    """Zaznamy neaktualizovane dlhsie ako N dni."""
+    return db.stale(days, domain)
+
+
+@mcp.tool()
+def ctx_recent(days: int = 7, domain: str | None = None) -> dict:
+    """Co sa zmenilo za poslednuch N dni."""
+    return db.recent(days, domain)
+
+
+# --- Scan management ---
+
+@mcp.tool()
+def ctx_scan_status() -> list[dict]:
+    """Stav poslednuch scanov pre kazdy zdroj."""
+    return db.scan_status()
+
+
+@mcp.tool()
+def ctx_set_scan(source: str, timestamp: str) -> dict:
+    """Nastav timestamp posledneho scanu. source: gmail/slack/asana/drive/calendar."""
+    return db.set_scan_marker(source, timestamp)
+
+
+@mcp.tool()
+def ctx_update_scan(source: str, processed: int, added: int, updated: int, notes: str = "") -> dict:
+    """Zaloguj dokonceny scan. Pouzivaj na konci kazdeho scanning tasku."""
+    return db.update_scan_stats(source, processed, added, updated, notes)
+
+
+# --- Action items ---
+
+@mcp.tool()
+def ctx_action_items(
+    status: str | None = "extracted",
+    owner: str | None = None,
+    project_id: int | None = None,
+) -> dict:
+    """Zoznam action itemov z meetingov/interakcii.
+    status: extracted/pushed_to_asana/done. owner: meno osoby. project_id: filter podla projektu."""
+    return db.get_action_items(status, owner, project_id)
+
+
+@mcp.tool()
+def ctx_mark_action_done(item_id: int, asana_task_id: str | None = None) -> dict:
+    """Oznac action item ako pushed do Asany alebo done."""
+    return db.mark_action_item_pushed(item_id, asana_task_id)
+
+
+# --- Decisions ---
+
+@mcp.tool()
+def ctx_decisions(project_id: int | None = None, status: str | None = "active") -> dict:
+    """Zoznam rozhodnuti. Volitelne filtruj podla projektu alebo statusu."""
+    return db.get_decisions(project_id, status)
+
+
+# --- Meeting participants ---
+
+@mcp.tool()
+def ctx_meeting_participants(interaction_id: int | None = None, person_id: int | None = None) -> dict:
+    """Ucastnici meetingu (podla interaction_id) alebo meetingy osoby (podla person_id)."""
+    return db.get_meeting_participants(interaction_id, person_id)
+
+
+# --- Single note ---
+
+@mcp.tool()
+def ctx_get_note(note_id: int) -> dict:
+    """Detail jednej poznamky podla ID."""
+    return db.get_note(note_id)
+
+
+# --- Export ---
+
+@mcp.tool()
+def ctx_export(domain: str | None = None) -> dict:
+    """Export celeho registra ako JSON. Volitelne filtruj podla domeny."""
+    return db.export_data(domain)
+
+
+# --- DB Restore (for Railway deployment) ---
+
+@mcp.tool()
+def ctx_restore_db(b64_chunk: str, chunk_index: int, total_chunks: int, upload_id: str = "default") -> dict:
+    """Nahraj DB po castiach (base64 chunky). Posledny chunk spusti restore.
+    Pouzivaj na migration DB na Railway."""
+    import base64
+    tmp_dir = "/tmp/db_upload"
+    os.makedirs(tmp_dir, exist_ok=True)
+    chunk_path = f"{tmp_dir}/{upload_id}_{chunk_index:04d}"
+    with open(chunk_path, "wb") as f:
+        f.write(base64.b64decode(b64_chunk))
+
+    if chunk_index + 1 == total_chunks:
+        # All chunks received — assemble and restore
+        db_path = db.DB_PATH
+        assembled = f"{tmp_dir}/{upload_id}_assembled.db"
+        with open(assembled, "wb") as out:
+            for i in range(total_chunks):
+                cp = f"{tmp_dir}/{upload_id}_{i:04d}"
+                with open(cp, "rb") as inp:
+                    out.write(inp.read())
+                os.remove(cp)
+        # Replace current DB
+        import shutil
+        shutil.copy2(assembled, db_path)
+        os.remove(assembled)
+        return {"status": "ok", "message": f"DB restored from {total_chunks} chunks", "path": db_path}
+
+    return {"status": "ok", "message": f"Chunk {chunk_index+1}/{total_chunks} received"}
+
+
+# --- Entry point ---
+
+def main():
+    """Run the MCP server.
+
+    Usage:
+        context-engine          # stdio (for Claude Code)
+        context-engine --http   # HTTP on port 8080 (for Cowork / remote)
+        context-engine --sse    # SSE on port 8080
+    Port override: CTX_PORT env var.
+    """
+    # Railway sets PORT, fallback to CTX_PORT, then 8080
+    port = int(os.environ.get("PORT", os.environ.get("CTX_PORT", "8080")))
+    host = os.environ.get("CTX_HOST", "0.0.0.0")
+    if "--http" in sys.argv:
+        # Override settings directly (env vars are read at FastMCP init time, too early)
+        mcp.settings.port = port
+        mcp.settings.host = host
+        mcp.run(transport="streamable-http")
+    elif "--sse" in sys.argv:
+        mcp.settings.port = port
+        mcp.settings.host = host
+        # Disable DNS rebinding protection for ngrok/Railway tunneling
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        )
+        mcp.run(transport="sse")
+    else:
+        mcp.run()
+
+
+if __name__ == "__main__":
+    main()
