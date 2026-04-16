@@ -92,7 +92,7 @@ Použi balíčkový manažér distribúcie: `apt install python3 python3-pip git
 Skontroluj `ls -la` — ak nevidíš `pyproject.toml` a `src/context_engine/`, spusti:
 
 ```bash
-git clone https://github.com/jarosatori/context-engine-community.git .
+git clone https://github.com/jarosatori/context-engine-produkt.git .
 ```
 
 (Bodka na konci = do aktuálnej zložky.)
@@ -192,7 +192,7 @@ Potrebuješ Python 3.10 alebo novší. Ak nemáš, nainštaluj cez:
 
 ### Krok 1.2 — Stiahni Context Engine
 
-Skopíruj folder `context-engine-community` niekam na disk. Odporúčanie:
+Skopíruj folder `context-engine-produkt` niekam na disk. Odporúčanie:
 ```bash
 # Mac/Linux
 ~/context-engine/

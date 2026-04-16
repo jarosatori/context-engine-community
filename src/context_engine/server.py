@@ -294,17 +294,29 @@ def ctx_log(
     channel: str | None = None,
     direction: str | None = None,
     summary: str | None = None,
+    details: str | None = None,
+    topics: str | None = None,
+    key_points: str | None = None,
+    sentiment: str | None = None,
+    follow_up: str | None = None,
+    duration_minutes: int | None = None,
     context: str | None = None,
     date: str | None = None,
     source_ref: str | None = None,
     domain: str = "work",
 ) -> dict:
     """Zaloguj interakciu (email, call, meeting...).
-    channel: email/slack/asana/call/meeting/sms. direction: incoming/outgoing/both."""
+    channel: email/slack/asana/call/meeting/sms. direction: incoming/outgoing/both.
+    summary: stručné 1-2 vety. details: detailný zápis (čím viac kontextu, tým lepšie).
+    topics: JSON array tém. key_points: JSON array kľúčových bodov.
+    sentiment: positive/neutral/negative/mixed. follow_up: čo treba spraviť.
+    duration_minutes: dĺžka v minútach."""
     data = InteractionInput(
         person_id=person_id, person_name=person_name, channel=channel,
-        direction=direction, summary=summary, context=context,
-        date=date, source_ref=source_ref, domain=domain,
+        direction=direction, summary=summary, details=details,
+        topics=topics, key_points=key_points, sentiment=sentiment,
+        follow_up=follow_up, duration_minutes=duration_minutes,
+        context=context, date=date, source_ref=source_ref, domain=domain,
     )
     return db.log_interaction(data.model_dump(exclude_none=True))
 

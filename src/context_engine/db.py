@@ -32,7 +32,8 @@ VALID_COLUMNS = {
     "rules": {"context", "rule", "example", "priority", "category", "applies_to",
               "notes", "status", "domain", "updated_at"},
     "interactions": {"person_id", "person_name", "channel", "direction", "summary",
-                     "context", "date", "source_ref", "domain"},
+                     "details", "topics", "key_points", "sentiment", "follow_up",
+                     "duration_minutes", "context", "date", "source_ref", "domain"},
     "notes": {"title", "content", "domain", "category", "tags",
               "related_person_id", "related_project_id", "source", "status", "updated_at"},
     "action_items": {"title", "owner_name", "owner_id", "source_interaction_id",
@@ -147,6 +148,12 @@ CREATE TABLE IF NOT EXISTS interactions (
     channel TEXT,
     direction TEXT,
     summary TEXT,
+    details TEXT,
+    topics TEXT,
+    key_points TEXT,
+    sentiment TEXT,
+    follow_up TEXT,
+    duration_minutes INTEGER,
     context TEXT,
     date TEXT DEFAULT (date('now')),
     source_ref TEXT,
@@ -290,6 +297,52 @@ CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
     VALUES (new.id, new.title, new.content, new.category, new.tags);
 END;
 
+-- FTS: companies
+CREATE VIRTUAL TABLE IF NOT EXISTS companies_fts USING fts5(
+    name, type, industry, notes,
+    content='companies', content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS companies_ai AFTER INSERT ON companies BEGIN
+    INSERT INTO companies_fts(rowid, name, type, industry, notes)
+    VALUES (new.id, new.name, new.type, new.industry, new.notes);
+END;
+
+CREATE TRIGGER IF NOT EXISTS companies_ad AFTER DELETE ON companies BEGIN
+    INSERT INTO companies_fts(companies_fts, rowid, name, type, industry, notes)
+    VALUES ('delete', old.id, old.name, old.type, old.industry, old.notes);
+END;
+
+CREATE TRIGGER IF NOT EXISTS companies_au AFTER UPDATE ON companies BEGIN
+    INSERT INTO companies_fts(companies_fts, rowid, name, type, industry, notes)
+    VALUES ('delete', old.id, old.name, old.type, old.industry, old.notes);
+    INSERT INTO companies_fts(rowid, name, type, industry, notes)
+    VALUES (new.id, new.name, new.type, new.industry, new.notes);
+END;
+
+-- FTS: interactions
+CREATE VIRTUAL TABLE IF NOT EXISTS interactions_fts USING fts5(
+    person_name, summary, details, context, topics, key_points, follow_up,
+    content='interactions', content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS interactions_ai AFTER INSERT ON interactions BEGIN
+    INSERT INTO interactions_fts(rowid, person_name, summary, details, context, topics, key_points, follow_up)
+    VALUES (new.id, new.person_name, new.summary, new.details, new.context, new.topics, new.key_points, new.follow_up);
+END;
+
+CREATE TRIGGER IF NOT EXISTS interactions_ad AFTER DELETE ON interactions BEGIN
+    INSERT INTO interactions_fts(interactions_fts, rowid, person_name, summary, details, context, topics, key_points, follow_up)
+    VALUES ('delete', old.id, old.person_name, old.summary, old.details, old.context, old.topics, old.key_points, old.follow_up);
+END;
+
+CREATE TRIGGER IF NOT EXISTS interactions_au AFTER UPDATE ON interactions BEGIN
+    INSERT INTO interactions_fts(interactions_fts, rowid, person_name, summary, details, context, topics, key_points, follow_up)
+    VALUES ('delete', old.id, old.person_name, old.summary, old.details, old.context, old.topics, old.key_points, old.follow_up);
+    INSERT INTO interactions_fts(rowid, person_name, summary, details, context, topics, key_points, follow_up)
+    VALUES (new.id, new.person_name, new.summary, new.details, new.context, new.topics, new.key_points, new.follow_up);
+END;
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_people_company ON people(company_id);
 CREATE INDEX IF NOT EXISTS idx_people_status ON people(status);
@@ -370,6 +423,29 @@ def _migrate(db) -> None:
         # Rebuild FTS index to include aliases
         db.execute("INSERT INTO people_fts(people_fts) VALUES('rebuild')")
 
+    # Migration: add rich interaction columns (added 2026-04-16)
+    int_cols = {row[1] for row in db.execute("PRAGMA table_info(interactions)").fetchall()}
+    for col, coltype in [
+        ("details", "TEXT"),
+        ("topics", "TEXT"),
+        ("key_points", "TEXT"),
+        ("sentiment", "TEXT"),
+        ("follow_up", "TEXT"),
+        ("duration_minutes", "INTEGER"),
+    ]:
+        if col not in int_cols:
+            db.execute(f"ALTER TABLE interactions ADD COLUMN {col} {coltype}")
+
+    # Rebuild FTS indexes after migration (companies + interactions)
+    try:
+        db.execute("INSERT INTO companies_fts(companies_fts) VALUES('rebuild')")
+    except Exception:
+        pass
+    try:
+        db.execute("INSERT INTO interactions_fts(interactions_fts) VALUES('rebuild')")
+    except Exception:
+        pass
+
 
 def init_db(db_path: str | None = None) -> dict:
     """Create database with full schema."""
@@ -378,7 +454,7 @@ def init_db(db_path: str | None = None) -> dict:
         _migrate(db)
         for source in SCAN_SOURCES:
             db.execute("INSERT OR IGNORE INTO scan_log (source) VALUES (?)", (source,))
-        db.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (3)")
+        db.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (4)")
     return {"status": "ok", "message": "Database initialized", "path": db_path or DB_PATH}
 
 
@@ -544,11 +620,19 @@ def find(query: str, domain: str | None = None, db_path: str | None = None) -> d
         if rows and "people" not in results:
             results["people"] = [dict(r) for r in rows]
 
-        # Companies
-        rows = db.execute(
-            f"SELECT * FROM companies WHERE (name LIKE ? OR type LIKE ? OR notes LIKE ?) {d_sql} LIMIT 10",
-            [like, like, like] + d_params
-        ).fetchall()
+        # Companies — FTS with LIKE fallback
+        try:
+            rows = db.execute(
+                f"SELECT c.* FROM companies c JOIN companies_fts f ON c.id = f.rowid WHERE companies_fts MATCH ? {('AND c.domain = ?' if domain else '')} ORDER BY rank LIMIT 10",
+                [query] + ([domain] if domain else [])
+            ).fetchall()
+            if not rows:
+                raise Exception("no fts results")
+        except Exception:
+            rows = db.execute(
+                f"SELECT * FROM companies WHERE (name LIKE ? OR type LIKE ? OR notes LIKE ?) {d_sql} LIMIT 10",
+                [like, like, like] + d_params
+            ).fetchall()
         if rows:
             results["companies"] = [dict(r) for r in rows]
 
@@ -616,6 +700,22 @@ def find(query: str, domain: str | None = None, db_path: str | None = None) -> d
         if rows:
             results["decisions"] = [dict(r) for r in rows]
 
+        # Interactions — FTS with LIKE fallback
+        try:
+            rows = db.execute(
+                f"SELECT i.* FROM interactions i JOIN interactions_fts f ON i.id = f.rowid WHERE interactions_fts MATCH ? {('AND i.domain = ?' if domain else '')} ORDER BY rank LIMIT 20",
+                [query] + ([domain] if domain else [])
+            ).fetchall()
+            if not rows:
+                raise Exception("no fts results")
+        except Exception:
+            rows = db.execute(
+                f"SELECT * FROM interactions WHERE (person_name LIKE ? OR summary LIKE ? OR details LIKE ? OR context LIKE ? OR topics LIKE ? OR key_points LIKE ? OR follow_up LIKE ?) {d_sql} LIMIT 20",
+                [like, like, like, like, like, like, like] + d_params
+            ).fetchall()
+        if rows:
+            results["interactions"] = [dict(r) for r in rows]
+
         total = sum(len(v) for v in results.values())
         return {"total": total, "results": results}
 
@@ -632,9 +732,9 @@ def get_person(query: str, db_path: str | None = None) -> dict:
         if match_type != "exact":
             result["_match_type"] = match_type
 
-        # Recent interactions
+        # Recent interactions — full detail
         interactions = db.execute(
-            "SELECT * FROM interactions WHERE person_id = ? ORDER BY date DESC LIMIT 10",
+            "SELECT * FROM interactions WHERE person_id = ? ORDER BY date DESC LIMIT 15",
             (person["id"],)
         ).fetchall()
         result["recent_interactions"] = [dict(i) for i in interactions]
@@ -773,9 +873,9 @@ def context_for(query: str, db_path: str | None = None) -> dict:
             if company:
                 ctx["company"] = {"name": company["name"], "type": company["type"], "my_role": company["my_role"]}
 
-        # Last 5 interactions
+        # Last 10 interactions (with details)
         interactions = db.execute(
-            "SELECT channel, direction, summary, date FROM interactions WHERE person_id = ? ORDER BY date DESC LIMIT 5",
+            "SELECT channel, direction, summary, details, topics, key_points, date FROM interactions WHERE person_id = ? ORDER BY date DESC LIMIT 10",
             (p["id"],)
         ).fetchall()
         ctx["recent_interactions"] = [dict(i) for i in interactions]

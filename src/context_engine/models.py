@@ -174,7 +174,13 @@ class InteractionInput(BaseModel):
     person_name: Optional[str] = None
     channel: Optional[str] = None
     direction: Optional[str] = None
-    summary: Optional[str] = None
+    summary: Optional[str] = Field(default=None, description="Stručné 1-2 vetové zhrnutie")
+    details: Optional[str] = Field(default=None, description="Detailný zápis — paragraf alebo viac. Sem patrí všetko dôležité z meetingu/callu.")
+    topics: Optional[str] = Field(default=None, description="JSON array tém, napr. '[\"pricing\", \"Q2\"]'")
+    key_points: Optional[str] = Field(default=None, description="JSON array kľúčových bodov")
+    sentiment: Optional[str] = Field(default=None, description="positive/neutral/negative/mixed")
+    follow_up: Optional[str] = Field(default=None, description="Čo treba spraviť po interakcii")
+    duration_minutes: Optional[int] = Field(default=None, description="Dĺžka v minútach")
     context: Optional[str] = None
     date: Optional[str] = None
     source_ref: Optional[str] = None
