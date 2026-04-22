@@ -7,8 +7,15 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import contextmanager
 
+import re
 from difflib import SequenceMatcher
 from context_engine.nicknames import expand_query_names, surname_similarity, FUZZY_THRESHOLD
+from context_engine.schema_meta import (
+    DOMAINS, CATEGORIES, CATEGORY_ALIASES, DOMAIN_FROM_CATEGORY,
+    SENTIMENTS, CHANNELS, FORMALITIES, TONES, RELATIONSHIPS,
+    REQUIRED_FIELDS, RECOMMENDED_FIELDS,
+    normalize_category, has_time_marker, auto_time_marker, quarter_marker,
+)
 
 DB_PATH = os.environ.get("CTX_DB", str(Path.home() / ".context-engine" / "context-engine.db"))
 
@@ -668,10 +675,15 @@ def find(query: str, domain: str | None = None, db_path: str | None = None) -> d
         if rows:
             results["rules"] = [dict(r) for r in rows]
 
-        # Notes — FTS with LIKE fallback
+        # Notes — FTS with snippet + bm25 score, LIKE fallback
         try:
             rows = db.execute(
-                f"SELECT n.* FROM notes n JOIN notes_fts f ON n.id = f.rowid WHERE notes_fts MATCH ? {('AND n.domain = ?' if domain else '')} ORDER BY rank LIMIT 20",
+                "SELECT n.*, "
+                "  snippet(notes_fts, -1, '«', '»', '…', 24) AS _snippet, "
+                "  bm25(notes_fts) AS _score "
+                "FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid "
+                f"WHERE notes_fts MATCH ? {('AND n.domain = ?' if domain else '')} "
+                "ORDER BY _score LIMIT 20",
                 [query] + ([domain] if domain else [])
             ).fetchall()
             if not rows:
@@ -700,10 +712,15 @@ def find(query: str, domain: str | None = None, db_path: str | None = None) -> d
         if rows:
             results["decisions"] = [dict(r) for r in rows]
 
-        # Interactions — FTS with LIKE fallback
+        # Interactions — FTS with snippet + bm25 score, LIKE fallback
         try:
             rows = db.execute(
-                f"SELECT i.* FROM interactions i JOIN interactions_fts f ON i.id = f.rowid WHERE interactions_fts MATCH ? {('AND i.domain = ?' if domain else '')} ORDER BY rank LIMIT 20",
+                "SELECT i.*, "
+                "  snippet(interactions_fts, -1, '«', '»', '…', 24) AS _snippet, "
+                "  bm25(interactions_fts) AS _score "
+                "FROM interactions_fts JOIN interactions i ON i.id = interactions_fts.rowid "
+                f"WHERE interactions_fts MATCH ? {('AND i.domain = ?' if domain else '')} "
+                "ORDER BY _score LIMIT 20",
                 [query] + ([domain] if domain else [])
             ).fetchall()
             if not rows:
@@ -901,14 +918,238 @@ def context_for(query: str, db_path: str | None = None) -> dict:
         return ctx
 
 
-def add_record(table: str, data: dict, db_path: str | None = None) -> dict:
-    """Add a record to a table with validation."""
+# ─────────────────────────────────────────────────────────────────────
+# VALIDATION + AUTO-ENRICHMENT helpers (Layer 2 + 3)
+# ─────────────────────────────────────────────────────────────────────
+
+def _parse_tags(tags) -> list:
+    """Robustne parsuje tags — JSON string, list, alebo CSV."""
+    if tags is None:
+        return []
+    if isinstance(tags, list):
+        return [str(t).strip() for t in tags if str(t).strip()]
+    if isinstance(tags, str):
+        s = tags.strip()
+        if not s:
+            return []
+        try:
+            v = json.loads(s)
+            if isinstance(v, list):
+                return [str(t).strip() for t in v if str(t).strip()]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        # Fallback — CSV
+        return [t.strip() for t in s.split(",") if t.strip()]
+    return []
+
+
+def _detect_mentioned_people(db, content: str, limit: int = 5) -> list[int]:
+    """Nájde person_id-čka, ktorých meno sa vyskytuje v `content`.
+
+    Použité pre auto-link notes ↔ people.
+    """
+    if not content or len(content) < 5:
+        return []
+    rows = db.execute(
+        "SELECT id, name FROM people WHERE status='active' AND length(name) > 4"
+    ).fetchall()
+    matched = []
+    for r in rows:
+        name = (r["name"] or "").strip()
+        if not name:
+            continue
+        # Whole-word match (case-insensitive)
+        pattern = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
+        if pattern.search(content):
+            matched.append(r["id"])
+            if len(matched) >= limit:
+                break
+    return matched
+
+
+def _validate_and_enrich_note(data: dict, db) -> tuple[dict, list[str], list[str]]:
+    """Validuje + obohatí note dáta. Vracia (clean_data, warnings, errors)."""
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    # 1. Required check (po enrichment-e)
+    # Najprv skús auto-fill čo sa dá
+
+    # 1a. Normalizuj category
+    raw_cat = data.get("category")
+    if raw_cat:
+        canonical, normalized = normalize_category(raw_cat)
+        data["category"] = canonical
+        if normalized:
+            warnings.append(f"category '{raw_cat}' → normalized to '{canonical}'")
+    else:
+        errors.append("category is required (e.g. 'meeting-notes', 'decision', 'strategy')")
+
+    # 1b. Auto-fill domain z category ak chýba
+    if not data.get("domain") and data.get("category"):
+        derived = DOMAIN_FROM_CATEGORY.get(data["category"])
+        if derived:
+            data["domain"] = derived
+            warnings.append(f"domain auto-derived from category → '{derived}'")
+        else:
+            errors.append("domain is required (work/personal/family/health/finance/home/education)")
+    elif data.get("domain") and data["domain"] not in DOMAINS:
+        errors.append(f"domain '{data['domain']}' invalid. Must be one of: {sorted(DOMAINS)}")
+
+    # 1c. Tags — parse + ensure time marker
+    tags = _parse_tags(data.get("tags"))
+    if not tags:
+        errors.append("tags is required (JSON array, must contain time marker like '2026-W17' + topic)")
+    else:
+        if not has_time_marker(tags):
+            tm = auto_time_marker(data.get("created_at") or data.get("date"))
+            tags.append(tm)
+            warnings.append(f"time marker auto-added to tags → '{tm}'")
+        data["tags"] = json.dumps(tags, ensure_ascii=False)
+
+    # 1d. Source default
+    if not data.get("source"):
+        data["source"] = "manual-input"
+        warnings.append("source defaulted to 'manual-input' (consider providing real source)")
+
+    # 1e. Hard-required (po auto-fill-e)
+    for f in REQUIRED_FIELDS["notes"]:
+        if not data.get(f):
+            errors.append(f"required field missing: {f}")
+
+    # 2. Auto-link to people (mentioned in content)
+    if data.get("content") and not data.get("related_person_id"):
+        mentioned = _detect_mentioned_people(db, data["content"])
+        if mentioned:
+            data["related_person_id"] = mentioned[0]
+            if len(mentioned) > 1:
+                warnings.append(f"auto-linked to person {mentioned[0]}; also mentions: {mentioned[1:]}")
+            else:
+                warnings.append(f"auto-linked to person {mentioned[0]}")
+
+    return data, warnings, errors
+
+
+def _validate_and_enrich_interaction(data: dict, db) -> tuple[dict, list[str], list[str]]:
+    """Validuje + obohatí interaction dáta."""
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    # channel required
+    if not data.get("channel"):
+        errors.append("channel is required (email/slack/asana/call/meeting/sms/...)")
+    elif data["channel"] not in CHANNELS:
+        warnings.append(f"channel '{data['channel']}' not in standard list: {sorted(CHANNELS)}")
+
+    # date default = today
+    if not data.get("date"):
+        data["date"] = datetime.now().strftime("%Y-%m-%d")
+        warnings.append("date defaulted to today")
+
+    # sentiment validation
+    if data.get("sentiment") and data["sentiment"] not in SENTIMENTS:
+        warnings.append(f"sentiment '{data['sentiment']}' not in {sorted(SENTIMENTS)}")
+
+    # need at least summary or details
+    if not data.get("summary") and not data.get("details"):
+        errors.append("at least one of (summary, details) is required")
+
+    # Auto-resolve person_id from person_name
+    if data.get("person_name") and not data.get("person_id"):
+        # Try _find_person_smart for fuzzy resolution
+        person, match_type = _find_person_smart(db, data["person_name"])
+        if person:
+            data["person_id"] = person["id"]
+            if match_type != "exact":
+                warnings.append(f"person_id resolved via {match_type} match → {person['name']} (id={person['id']})")
+
+    # Domain default
+    if not data.get("domain"):
+        data["domain"] = "work"
+        warnings.append("domain defaulted to 'work'")
+
+    # Topics/key_points must be JSON arrays if provided
+    for f in ("topics", "key_points"):
+        if data.get(f):
+            parsed = _parse_tags(data[f])
+            data[f] = json.dumps(parsed, ensure_ascii=False) if parsed else None
+
+    # Soft warnings — chýbajúce recommended
+    for f in RECOMMENDED_FIELDS["interactions"]:
+        if not data.get(f):
+            warnings.append(f"recommended field missing: {f}")
+
+    return data, warnings, errors
+
+
+def _validate_and_enrich_person(data: dict, db) -> tuple[dict, list[str], list[str]]:
+    """Validuje + obohatí person dáta."""
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    if not data.get("name") or not data["name"].strip():
+        errors.append("name is required")
+        return data, warnings, errors
+
+    # Validate enums
+    if data.get("formality") and data["formality"] not in FORMALITIES:
+        warnings.append(f"formality '{data['formality']}' invalid; defaulting to 'uncertain'")
+        data["formality"] = "uncertain"
+
+    if data.get("relationship") and data["relationship"] not in RELATIONSHIPS:
+        warnings.append(f"relationship '{data['relationship']}' not standard")
+
+    # Auto-set domain
+    if not data.get("domain"):
+        data["domain"] = "work"
+
+    # Soft warnings
+    for f in RECOMMENDED_FIELDS["people"]:
+        if not data.get(f):
+            warnings.append(f"recommended field missing: {f}")
+
+    return data, warnings, errors
+
+
+def add_record(table: str, data: dict, db_path: str | None = None,
+               strict: bool = True) -> dict:
+    """Add a record with validation + auto-enrichment.
+
+    `strict=True` → reject on errors (default).
+    `strict=False` → return record with warnings + errors but still insert (not used in production).
+    """
     _validate_table(table)
+
+    # Schema-aware validation per table
+    enrichers = {
+        "notes": _validate_and_enrich_note,
+        "interactions": _validate_and_enrich_interaction,
+        "people": _validate_and_enrich_person,
+    }
+
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    if table in enrichers:
+        with get_db(db_path) as db:
+            data, warnings, errors = enrichers[table](data, db)
+
+    if errors and strict:
+        return {
+            "status": "error",
+            "code": "VALIDATION_FAILED",
+            "errors": errors,
+            "warnings": warnings,
+            "hint": "Doplň povinné polia a skús znova. Pre notes pozri ctx_categories() pre platné category.",
+        }
+
     columns_to_write = set(data.keys())
-    valid = VALID_COLUMNS.get(table, set()) | {"name", "title", "context", "rule", "person_id",
-                                                 "person_name", "channel", "direction", "summary",
-                                                 "date", "source_ref", "created_at", "first_seen",
-                                                 "email", "phone", "company_id"}
+    valid = VALID_COLUMNS.get(table, set()) | {
+        "name", "title", "context", "rule", "person_id",
+        "person_name", "channel", "direction", "summary",
+        "date", "source_ref", "created_at", "first_seen",
+        "email", "phone", "company_id",
+    }
     invalid = columns_to_write - valid
     if invalid:
         return {"status": "error", "error": f"Invalid columns for {table}: {invalid}"}
@@ -924,7 +1165,10 @@ def add_record(table: str, data: dict, db_path: str | None = None) -> dict:
     with get_db(db_path) as db:
         try:
             cursor = db.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", values)
-            return {"status": "ok", "id": cursor.lastrowid, "table": table}
+            result = {"status": "ok", "id": cursor.lastrowid, "table": table}
+            if warnings:
+                result["warnings"] = warnings
+            return result
         except sqlite3.IntegrityError as e:
             if "UNIQUE constraint" in str(e):
                 return {"status": "duplicate", "error": str(e), "hint": "Use 'update' command instead"}
@@ -970,21 +1214,70 @@ def update_record(table: str, record_id: int, data: dict, db_path: str | None = 
 
 
 def log_interaction(data: dict, db_path: str | None = None) -> dict:
-    """Log an interaction."""
-    columns = ", ".join(data.keys())
-    placeholders = ", ".join(["?" for _ in data])
-    values = list(data.values())
-
-    with get_db(db_path) as db:
-        cursor = db.execute(f"INSERT INTO interactions ({columns}) VALUES ({placeholders})", values)
-        if "person_id" in data:
+    """Log an interaction with validation + auto-enrichment."""
+    # Use add_record for validation + enrichment
+    result = add_record("interactions", data, db_path)
+    if result.get("status") == "ok" and data.get("person_id"):
+        with get_db(db_path) as db:
             db.execute("UPDATE people SET updated_at = ? WHERE id = ?",
                        (datetime.now().isoformat(), data["person_id"]))
-        return {"status": "ok", "id": cursor.lastrowid}
+    return result
 
 
-def add_note(data: dict, db_path: str | None = None) -> dict:
-    """Add a note to the knowledge base."""
+def _find_similar_notes(db, title: str, content: str, limit: int = 3,
+                        min_score: float = 0.5) -> list[dict]:
+    """Nájde existujúce notes ktoré sú podobné novej (title+content prefix).
+
+    Použité na dedupe warning v add_note.
+    """
+    if not title and not content:
+        return []
+    # Build FTS query from title + first 100 chars of content
+    query_text = f"{title or ''} {(content or '')[:100]}"
+    keywords = [w for w in re.findall(r"\w{4,}", query_text) if w.lower() not in {
+        "this", "that", "with", "from", "about", "have", "they", "have", "their",
+        "ktorý", "tento", "tato", "alebo", "preto", "veľmi", "velmi",
+    }]
+    if not keywords:
+        return []
+    fts_q = " OR ".join(keywords[:8])
+    try:
+        rows = db.execute(
+            "SELECT n.id, n.title, n.category, n.created_at, "
+            "  snippet(notes_fts, -1, '«', '»', '…', 20) as preview, "
+            "  bm25(notes_fts) as score "
+            "FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid "
+            "WHERE notes_fts MATCH ? "
+            "ORDER BY score LIMIT ?",
+            (fts_q, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
+
+
+def add_note(data: dict, db_path: str | None = None,
+             skip_dedupe_check: bool = False) -> dict:
+    """Add a note to the knowledge base.
+
+    Pred zápisom skontroluje či neexistuje veľmi podobná note (dedupe warning).
+    Ak áno, vráti `status='duplicate_warning'` s návrhmi — ak chceš pokračovať
+    aj tak, zavolaj znova s `skip_dedupe_check=True`.
+    """
+    if not skip_dedupe_check and (data.get("title") or data.get("content")):
+        with get_db(db_path) as db:
+            similar = _find_similar_notes(db, data.get("title", ""), data.get("content", ""))
+            if similar:
+                return {
+                    "status": "duplicate_warning",
+                    "code": "SIMILAR_NOTES_EXIST",
+                    "similar": similar,
+                    "hint": (
+                        "Nájdené podobné existujúce notes. Pred vytvorením novej zváž ctx_update "
+                        "na existujúcu (id v 'similar'). Ak naozaj chceš novú, zavolaj znova "
+                        "s skip_dedupe_check=True."
+                    ),
+                }
     return add_record("notes", data, db_path)
 
 
@@ -1283,3 +1576,438 @@ def export_data(domain: str | None = None, db_path: str | None = None) -> dict:
             result[table] = [dict(r) for r in rows]
 
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Layer 4: Advanced search (structured filters)
+# ─────────────────────────────────────────────────────────────────────
+
+def search_advanced(
+    query: str | None = None,
+    table: str | None = None,
+    domain: str | None = None,
+    category: str | None = None,
+    tags_any: list[str] | None = None,
+    tags_all: list[str] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    person: str | None = None,
+    sort: str = "relevance",
+    limit: int = 20,
+    db_path: str | None = None,
+) -> dict:
+    """Štruktúrovaný search nad notes/interactions/people s filtrami.
+
+    Vracia matched rows s `_snippet` a `_score` (kde dostupné).
+    """
+    valid_tables = {"notes", "interactions", "people"}
+    if table and table not in valid_tables:
+        return {"status": "error", "error": f"table must be one of {valid_tables}"}
+
+    targets = [table] if table else list(valid_tables)
+    out: dict = {}
+
+    with get_db(db_path) as db:
+        for tbl in targets:
+            results = _search_table(
+                db, tbl, query=query, domain=domain, category=category,
+                tags_any=tags_any, tags_all=tags_all,
+                date_from=date_from, date_to=date_to, person=person,
+                sort=sort, limit=limit,
+            )
+            if results:
+                out[tbl] = results
+
+    out["total"] = sum(len(v) for v in out.values() if isinstance(v, list))
+    out["filters"] = {k: v for k, v in {
+        "query": query, "table": table, "domain": domain, "category": category,
+        "tags_any": tags_any, "tags_all": tags_all,
+        "date_from": date_from, "date_to": date_to,
+        "person": person, "sort": sort, "limit": limit,
+    }.items() if v is not None}
+    return out
+
+
+def _search_table(db, table: str, query=None, domain=None, category=None,
+                  tags_any=None, tags_all=None, date_from=None, date_to=None,
+                  person=None, sort="relevance", limit=20) -> list[dict]:
+    """Helper — search 1 tabuľky s filtrami."""
+    where = ["1=1"]
+    params: list = []
+    select_extra = ""
+    join = ""
+    order = "ORDER BY id DESC"
+
+    fts_table_map = {
+        "notes": "notes_fts",
+        "interactions": "interactions_fts",
+        "people": "people_fts",
+    }
+    fts = fts_table_map.get(table)
+
+    if query and fts:
+        select_extra = (
+            f", snippet({fts}, -1, '«', '»', '…', 24) AS _snippet, "
+            f"bm25({fts}) AS _score"
+        )
+        join = f"JOIN {fts} ON {fts}.rowid = {table}.id"
+        where.append(f"{fts} MATCH ?")
+        params.append(query)
+        if sort == "relevance":
+            order = "ORDER BY _score"
+    elif query:
+        # No FTS available — LIKE fallback
+        like = f"%{query}%"
+        if table == "notes":
+            where.append("(title LIKE ? OR content LIKE ?)")
+            params.extend([like, like])
+        elif table == "interactions":
+            where.append("(summary LIKE ? OR details LIKE ?)")
+            params.extend([like, like])
+        elif table == "people":
+            where.append("(name LIKE ? OR email LIKE ?)")
+            params.extend([like, like])
+
+    if domain:
+        where.append(f"{table}.domain = ?")
+        params.append(domain)
+
+    if category and table == "notes":
+        canonical, _ = normalize_category(category)
+        where.append("category = ?")
+        params.append(canonical)
+
+    if tags_all:
+        for t in tags_all:
+            where.append("tags LIKE ?")
+            params.append(f"%{t}%")
+    if tags_any:
+        sub = " OR ".join("tags LIKE ?" for _ in tags_any)
+        where.append(f"({sub})")
+        for t in tags_any:
+            params.append(f"%{t}%")
+
+    if date_from:
+        date_col = "date" if table == "interactions" else "created_at"
+        where.append(f"{date_col} >= ?")
+        params.append(date_from)
+    if date_to:
+        date_col = "date" if table == "interactions" else "created_at"
+        where.append(f"{date_col} <= ?")
+        params.append(date_to)
+
+    if person:
+        if table == "interactions":
+            where.append("person_name LIKE ?")
+            params.append(f"%{person}%")
+        elif table == "notes":
+            # match via related_person_id if person resolves
+            p, _mt = _find_person_smart(db, person)
+            if p:
+                where.append("related_person_id = ?")
+                params.append(p["id"])
+        elif table == "people":
+            where.append("name LIKE ?")
+            params.append(f"%{person}%")
+
+    if sort == "recent":
+        date_col = "date" if table == "interactions" else "created_at"
+        order = f"ORDER BY {date_col} DESC"
+    elif sort == "oldest":
+        date_col = "date" if table == "interactions" else "created_at"
+        order = f"ORDER BY {date_col} ASC"
+
+    sql = (
+        f"SELECT {table}.*{select_extra} "
+        f"FROM {table} {join} "
+        f"WHERE {' AND '.join(where)} "
+        f"{order} LIMIT ?"
+    )
+    params.append(limit)
+
+    try:
+        rows = db.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError as e:
+        # Fallback bez FTS
+        return [{"_error": str(e)}]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Layer 6: Health & hygiene tools
+# ─────────────────────────────────────────────────────────────────────
+
+def health_report(db_path: str | None = None) -> dict:
+    """Coverage report — koľko záznamov má vyplnené metadáta a koľko nie."""
+    with get_db(db_path) as db:
+        report = {}
+
+        # NOTES
+        n = db.execute("SELECT COUNT(*) c FROM notes").fetchone()["c"]
+        if n > 0:
+            r = db.execute("""
+                SELECT
+                  SUM(CASE WHEN domain IS NULL OR domain='' THEN 1 ELSE 0 END) miss_domain,
+                  SUM(CASE WHEN category IS NULL OR category='' THEN 1 ELSE 0 END) miss_category,
+                  SUM(CASE WHEN tags IS NULL OR tags='' THEN 1 ELSE 0 END) miss_tags,
+                  SUM(CASE WHEN source IS NULL OR source='' THEN 1 ELSE 0 END) miss_source,
+                  SUM(CASE WHEN related_person_id IS NULL THEN 1 ELSE 0 END) no_person_link
+                FROM notes
+            """).fetchone()
+            # Time markers
+            tm_missing = 0
+            for row in db.execute("SELECT tags FROM notes WHERE tags IS NOT NULL AND tags != ''"):
+                tags = _parse_tags(row["tags"])
+                if not has_time_marker(tags):
+                    tm_missing += 1
+            tm_missing += r["miss_tags"]  # missing tags = no time marker either
+            report["notes"] = {
+                "total": n,
+                "missing_domain": r["miss_domain"],
+                "missing_category": r["miss_category"],
+                "missing_tags": r["miss_tags"],
+                "without_time_marker": tm_missing,
+                "missing_source": r["miss_source"],
+                "no_person_link": r["no_person_link"],
+            }
+
+        # INTERACTIONS
+        i = db.execute("SELECT COUNT(*) c FROM interactions").fetchone()["c"]
+        if i > 0:
+            r = db.execute("""
+                SELECT
+                  SUM(CASE WHEN details IS NULL OR details='' THEN 1 ELSE 0 END) miss_details,
+                  SUM(CASE WHEN topics IS NULL OR topics='' THEN 1 ELSE 0 END) miss_topics,
+                  SUM(CASE WHEN key_points IS NULL OR key_points='' THEN 1 ELSE 0 END) miss_keypoints,
+                  SUM(CASE WHEN sentiment IS NULL OR sentiment='' THEN 1 ELSE 0 END) miss_sentiment,
+                  SUM(CASE WHEN duration_minutes IS NULL THEN 1 ELSE 0 END) miss_duration,
+                  SUM(CASE WHEN person_id IS NULL THEN 1 ELSE 0 END) no_person_id
+                FROM interactions
+            """).fetchone()
+            report["interactions"] = {
+                "total": i,
+                "missing_details": r["miss_details"],
+                "missing_topics": r["miss_topics"],
+                "missing_key_points": r["miss_keypoints"],
+                "missing_sentiment": r["miss_sentiment"],
+                "missing_duration_minutes": r["miss_duration"],
+                "missing_person_id": r["no_person_id"],
+            }
+
+        # PEOPLE
+        p = db.execute("SELECT COUNT(*) c FROM people").fetchone()["c"]
+        if p > 0:
+            r = db.execute("""
+                SELECT
+                  SUM(CASE WHEN formality='uncertain' OR formality IS NULL THEN 1 ELSE 0 END) uncertain_formality,
+                  SUM(CASE WHEN tone IS NULL OR tone='' THEN 1 ELSE 0 END) miss_tone,
+                  SUM(CASE WHEN relationship IS NULL OR relationship='' THEN 1 ELSE 0 END) miss_rel,
+                  SUM(CASE WHEN company_name IS NULL OR company_name='' THEN 1 ELSE 0 END) miss_company,
+                  SUM(CASE WHEN tags IS NULL OR tags='' THEN 1 ELSE 0 END) miss_tags
+                FROM people
+            """).fetchone()
+            report["people"] = {
+                "total": p,
+                "uncertain_formality": r["uncertain_formality"],
+                "missing_tone": r["miss_tone"],
+                "missing_relationship": r["miss_rel"],
+                "missing_company": r["miss_company"],
+                "missing_tags": r["miss_tags"],
+            }
+
+        # Recommendations
+        recs = []
+        nx = report.get("notes", {})
+        if nx.get("without_time_marker", 0) / max(nx.get("total", 1), 1) > 0.3:
+            recs.append(f"Notes — {nx['without_time_marker']}/{nx['total']} bez časového markera. Spusti ctx_backfill_metadata().")
+        if nx.get("missing_tags", 0) / max(nx.get("total", 1), 1) > 0.2:
+            recs.append(f"Notes — {nx['missing_tags']}/{nx['total']} bez tagov. Spusti ctx_backfill_metadata().")
+        ix = report.get("interactions", {})
+        if ix.get("missing_details", 0) / max(ix.get("total", 1), 1) > 0.5:
+            recs.append(f"Interactions — {ix['missing_details']}/{ix['total']} bez details. Pridať z fireflies pri budúcich logoch.")
+        px = report.get("people", {})
+        if px.get("missing_tags", 0) / max(px.get("total", 1), 1) > 0.7:
+            recs.append(f"People — {px['missing_tags']}/{px['total']} bez tagov. Pridávaj tagy pri komunikácii.")
+
+        report["recommendations"] = recs
+        return report
+
+
+def find_duplicates(table: str = "notes", threshold: float = 0.85,
+                    db_path: str | None = None) -> dict:
+    """Nájde pravdepodobné duplicity na základe fuzzy match key fieldov."""
+    if table not in {"notes", "people", "companies"}:
+        return {"status": "error", "error": "table must be notes/people/companies"}
+
+    duplicates: list[dict] = []
+
+    with get_db(db_path) as db:
+        if table == "notes":
+            rows = db.execute("SELECT id, title, category, created_at FROM notes ORDER BY id").fetchall()
+            for i in range(len(rows)):
+                for j in range(i + 1, min(i + 50, len(rows))):  # window 50 to avoid n²
+                    a, b = rows[i]["title"] or "", rows[j]["title"] or ""
+                    if not a or not b:
+                        continue
+                    score = SequenceMatcher(None, a.lower(), b.lower()).ratio()
+                    if score >= threshold:
+                        duplicates.append({
+                            "id_a": rows[i]["id"], "title_a": a,
+                            "id_b": rows[j]["id"], "title_b": b,
+                            "score": round(score, 2),
+                        })
+        elif table == "people":
+            rows = db.execute("SELECT id, name, email FROM people").fetchall()
+            for i in range(len(rows)):
+                for j in range(i + 1, len(rows)):
+                    a, b = (rows[i]["name"] or "").lower(), (rows[j]["name"] or "").lower()
+                    if not a or not b:
+                        continue
+                    score = SequenceMatcher(None, a, b).ratio()
+                    # Same email = sure dupe
+                    same_email = (rows[i]["email"] and rows[i]["email"] == rows[j]["email"])
+                    if score >= threshold or same_email:
+                        duplicates.append({
+                            "id_a": rows[i]["id"], "name_a": rows[i]["name"], "email_a": rows[i]["email"],
+                            "id_b": rows[j]["id"], "name_b": rows[j]["name"], "email_b": rows[j]["email"],
+                            "score": round(score, 2),
+                            "same_email": bool(same_email),
+                        })
+        elif table == "companies":
+            rows = db.execute("SELECT id, name FROM companies").fetchall()
+            for i in range(len(rows)):
+                for j in range(i + 1, len(rows)):
+                    a, b = (rows[i]["name"] or "").lower(), (rows[j]["name"] or "").lower()
+                    score = SequenceMatcher(None, a, b).ratio()
+                    if score >= threshold:
+                        duplicates.append({
+                            "id_a": rows[i]["id"], "name_a": rows[i]["name"],
+                            "id_b": rows[j]["id"], "name_b": rows[j]["name"],
+                            "score": round(score, 2),
+                        })
+
+    return {"table": table, "threshold": threshold, "count": len(duplicates), "duplicates": duplicates}
+
+
+def find_orphans(db_path: str | None = None) -> dict:
+    """Nájde záznamy bez správnych väzieb (notes bez person/project, interactions bez person_id, atď.)."""
+    out = {}
+    with get_db(db_path) as db:
+        out["notes_without_person_link"] = [dict(r) for r in db.execute(
+            "SELECT id, title, category, created_at FROM notes "
+            "WHERE related_person_id IS NULL AND related_project_id IS NULL "
+            "ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()]
+        out["interactions_without_person_id"] = [dict(r) for r in db.execute(
+            "SELECT id, person_name, channel, summary, date FROM interactions "
+            "WHERE person_id IS NULL AND person_name IS NOT NULL "
+            "ORDER BY date DESC LIMIT 50"
+        ).fetchall()]
+        out["people_without_company_link"] = [dict(r) for r in db.execute(
+            "SELECT id, name, email, role FROM people "
+            "WHERE (company_id IS NULL OR company_id = 0) AND status = 'active' "
+            "ORDER BY name LIMIT 50"
+        ).fetchall()]
+        out["counts"] = {k: len(v) for k, v in out.items()}
+    return out
+
+
+def backfill_metadata(db_path: str | None = None, dry_run: bool = False) -> dict:
+    """One-time migration:
+    1. Normalizuje category v notes (alias → canonical)
+    2. Doplní time marker do tagov ak chýba (z created_at)
+    3. Doplní domain z category mapping ak chýba
+    4. Auto-link mentioned people v notes content → related_person_id
+    """
+    stats = {
+        "notes_processed": 0,
+        "categories_normalized": 0,
+        "time_markers_added": 0,
+        "domains_filled": 0,
+        "person_links_added": 0,
+        "interactions_person_id_resolved": 0,
+    }
+
+    with get_db(db_path) as db:
+        notes = db.execute("SELECT * FROM notes").fetchall()
+        for n in notes:
+            stats["notes_processed"] += 1
+            updates: dict = {}
+
+            # 1. Normalize category
+            current_cat = n["category"]
+            canonical, was_normalized = normalize_category(current_cat)
+            if was_normalized and current_cat:
+                updates["category"] = canonical
+                stats["categories_normalized"] += 1
+
+            # 2. Fill domain from category
+            if (not n["domain"]) and (canonical or current_cat):
+                cat_for_domain = canonical or current_cat
+                derived = DOMAIN_FROM_CATEGORY.get(cat_for_domain)
+                if derived:
+                    updates["domain"] = derived
+                    stats["domains_filled"] += 1
+
+            # 3. Add time marker to tags
+            tags = _parse_tags(n["tags"])
+            if not has_time_marker(tags):
+                tm = auto_time_marker(n["created_at"])
+                tags.append(tm)
+                # Add quarter as bonus
+                qt = quarter_marker(n["created_at"])
+                if qt not in tags:
+                    tags.append(qt)
+                updates["tags"] = json.dumps(tags, ensure_ascii=False)
+                stats["time_markers_added"] += 1
+
+            # 4. Auto-link mentioned person
+            if n["related_person_id"] is None and n["content"]:
+                mentioned = _detect_mentioned_people(db, n["content"], limit=1)
+                if mentioned:
+                    updates["related_person_id"] = mentioned[0]
+                    stats["person_links_added"] += 1
+
+            if updates and not dry_run:
+                set_clause = ", ".join(f"{k} = ?" for k in updates)
+                vals = list(updates.values()) + [datetime.now().isoformat(), n["id"]]
+                db.execute(
+                    f"UPDATE notes SET {set_clause}, updated_at = ? WHERE id = ?",
+                    vals,
+                )
+
+        # 5. Resolve missing person_id in interactions
+        unresolved = db.execute(
+            "SELECT id, person_name FROM interactions WHERE person_id IS NULL AND person_name IS NOT NULL"
+        ).fetchall()
+        for row in unresolved:
+            person, _mt = _find_person_smart(db, row["person_name"])
+            if person and not dry_run:
+                db.execute("UPDATE interactions SET person_id = ? WHERE id = ?",
+                           (person["id"], row["id"]))
+                stats["interactions_person_id_resolved"] += 1
+            elif person:
+                stats["interactions_person_id_resolved"] += 1
+
+    stats["dry_run"] = dry_run
+    return stats
+
+
+def categories_list() -> dict:
+    """Vráti zoznam povolených category s popismi + aliasy + DOMAIN mapping."""
+    return {
+        "categories": CATEGORIES,
+        "aliases": CATEGORY_ALIASES,
+        "domain_mapping": DOMAIN_FROM_CATEGORY,
+        "domains": sorted(DOMAINS),
+        "channels": sorted(CHANNELS),
+        "sentiments": sorted(SENTIMENTS),
+        "formalities": sorted(FORMALITIES),
+        "tones": sorted(TONES),
+        "relationships": sorted(RELATIONSHIPS),
+        "hint": (
+            "Pri ctx_add_note POVINNÉ vyplniť: title, content, domain, category, tags, source. "
+            "Tags MUSIA obsahovať časový marker (napr. '2026-W17' alebo 'Q2-2026'). "
+            "Ak je category alias (napr. 'meeting'), automaticky sa normalizuje na canonical ('meeting-notes')."
+        ),
+    }

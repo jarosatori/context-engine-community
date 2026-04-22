@@ -59,8 +59,26 @@ class TestAddAndFind:
         assert result["status"] == "ok"
 
     def test_add_note(self, tmp_db):
-        result = db.add_note({"title": "Heslo k wifi", "content": "abc123", "domain": "home", "category": "reference"}, tmp_db)
+        result = db.add_note({
+            "title": "Heslo k wifi", "content": "abc123",
+            "domain": "home", "category": "reference",
+            "tags": '["password", "2026-W17"]', "source": "manual-input",
+        }, tmp_db, skip_dedupe_check=True)
         assert result["status"] == "ok"
+
+    def test_add_note_missing_required(self, tmp_db):
+        result = db.add_note({"title": "T", "content": "x", "domain": "home", "category": "reference"}, tmp_db, skip_dedupe_check=True)
+        assert result["status"] == "error"
+        assert result["code"] == "VALIDATION_FAILED"
+
+    def test_add_note_alias_normalization(self, tmp_db):
+        result = db.add_note({
+            "title": "Q&A Peter", "content": "meeting content here",
+            "domain": "work", "category": "meeting",
+            "tags": '["test", "2026-W17"]', "source": "test",
+        }, tmp_db, skip_dedupe_check=True)
+        assert result["status"] == "ok"
+        assert any("normalized" in w for w in result.get("warnings", []))
 
     def test_find_person(self, tmp_db):
         db.add_record("people", {"name": "Martin Marko", "email": "martin@test.sk"}, tmp_db)
@@ -83,8 +101,16 @@ class TestAddAndFind:
         assert "Personal Person" in personal_names
 
     def test_find_notes(self, tmp_db):
-        db.add_note({"title": "Wifi heslo doma", "content": "SuperSecret123", "domain": "home", "category": "reference"}, tmp_db)
-        db.add_note({"title": "Fitness plan", "content": "3x tyzdenne", "domain": "health", "category": "plan"}, tmp_db)
+        db.add_note({
+            "title": "Wifi heslo doma", "content": "SuperSecret123",
+            "domain": "home", "category": "reference",
+            "tags": '["password", "2026-W17"]', "source": "test",
+        }, tmp_db, skip_dedupe_check=True)
+        db.add_note({
+            "title": "Fitness plan", "content": "3x tyzdenne",
+            "domain": "health", "category": "health-record",
+            "tags": '["fitness", "2026-W17"]', "source": "test",
+        }, tmp_db, skip_dedupe_check=True)
 
         result = db.find_notes("wifi", db_path=tmp_db)
         assert result["total"] >= 1
@@ -131,7 +157,12 @@ class TestGetDetails:
         assert len(result["rules"]) >= 1
 
     def test_get_note(self, tmp_db):
-        add_result = db.add_note({"title": "Test Note", "content": "content"}, tmp_db)
+        add_result = db.add_note({
+            "title": "Test Note", "content": "content body",
+            "domain": "personal", "category": "reference",
+            "tags": '["test", "2026-W17"]', "source": "test",
+        }, tmp_db, skip_dedupe_check=True)
+        assert add_result["status"] == "ok", add_result
         note = db.get_note(add_result["id"], db_path=tmp_db)
         assert note["title"] == "Test Note"
 

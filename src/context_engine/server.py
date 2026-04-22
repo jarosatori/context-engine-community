@@ -245,25 +245,55 @@ def ctx_add_rule(
 @mcp.tool()
 def ctx_add_note(
     title: str,
-    content: str | None = None,
-    domain: str = "personal",
-    category: str | None = None,
-    tags: str | None = None,
+    content: str,
+    domain: str,
+    category: str,
+    tags: str,
+    source: str,
     related_person_id: int | None = None,
     related_project_id: int | None = None,
-    source: str | None = None,
     status: str = "active",
+    skip_dedupe_check: bool = False,
 ) -> dict:
-    """Pridaj poznamku/znalost do znalostnej bazy.
-    Pouzi pre vsetko co nema vlastnu tabulku — recepty, hesla, referencie, napady, zdravotne zaznamy.
-    domain: personal/home/health/finance/family/education/work.
-    category: health, finance, recipe, idea, reference, alebo lubovolny text."""
+    """Pridaj poznámku do znalostnej bázy. POVINNÉ POLIA: title, content, domain, category, tags, source.
+
+    domain — kde patrí: work / personal / family / health / finance / home / education
+    category — typ obsahu (canonical):
+      • work: ops-summary, weekly-review, decision, strategy, priority, milestone, run-metrics,
+        meeting-notes, q&a, session-recap, client-communication, offer-process,
+        competitor-analysis, pricing, content-pattern, messaging, marketing, branding,
+        infrastructure, architecture, tech, ai-tools, workflow
+      • finance: deal-analysis
+      • education: bootcamp-notes, lecture, course-content, mentoring
+      • personal: personal-reflection, insight, idea, question, todo, reference
+      • health: health-record   • family: family-event   • home: home-maintenance
+      Aliasy ako 'meeting' alebo 'rozhodnutie' sa automaticky normalizujú.
+      Plný zoznam: zavolaj ctx_categories().
+
+    tags — JSON array ako string. MUSÍ obsahovať:
+      (a) časový marker: '2026-W17' alebo 'Q2-2026' alebo '2026-04-22'  (auto-doplní sa ak chýba)
+      (b) 1–3 témy: 'pricing', 'hiring', 'ai-agents', ...
+      Voliteľne: '@meno-osoby', '&firma', '#projekt'
+
+    source — odkiaľ informácia pochádza: napr. 'meeting:fireflies-<ID>',
+      'cowork-thread', 'scheduled-task:<name>', 'manual-input', 'email:<thread-id>'
+
+    related_person_id / related_project_id — ak vieš osobu/projekt, prepoj.
+      Ak sa meno osoby spomína v content, link sa pridá automaticky.
+
+    skip_dedupe_check — ak True, neskontroluje existujúce podobné notes (default False).
+
+    VRACIA:
+      success → {status: 'ok', id: N, warnings: [...]}
+      duplicate → {status: 'duplicate_warning', similar: [...]} — zváž ctx_update na existujúcu
+      error → {status: 'error', code: 'VALIDATION_FAILED', errors: [...], hint: ...}
+    """
     data = NoteInput(
         title=title, content=content, domain=domain, category=category,
         tags=tags, related_person_id=related_person_id,
         related_project_id=related_project_id, source=source, status=status,
     )
-    return db.add_note(data.model_dump(exclude_none=True))
+    return db.add_note(data.model_dump(exclude_none=True), skip_dedupe_check=skip_dedupe_check)
 
 
 @mcp.tool()
@@ -305,12 +335,28 @@ def ctx_log(
     source_ref: str | None = None,
     domain: str = "work",
 ) -> dict:
-    """Zaloguj interakciu (email, call, meeting...).
-    channel: email/slack/asana/call/meeting/sms. direction: incoming/outgoing/both.
-    summary: stručné 1-2 vety. details: detailný zápis (čím viac kontextu, tým lepšie).
-    topics: JSON array tém. key_points: JSON array kľúčových bodov.
-    sentiment: positive/neutral/negative/mixed. follow_up: čo treba spraviť.
-    duration_minutes: dĺžka v minútach."""
+    """Zaloguj interakciu (email, call, meeting, slack...). POVINNÉ: channel.
+
+    Pri MEETINGU vždy vyplň aspoň: channel, person_name (alebo person_id), summary,
+    DETAILS (dlhý zápis!), topics (JSON array), date, duration_minutes.
+    Bez details a topics sa potom nedá nič nájsť cez ctx_find — toto je jedna
+    z najčastejších chýb. Radšej napíš dlhšie, krátiť sa dá vždy.
+
+    channel — email / slack / asana / call / meeting / sms / whatsapp / telegram
+              / linkedin / in-person / video-call
+    direction — incoming / outgoing / both
+    summary — 1-2 vetové zhrnutie pre rýchly prehľad
+    details — DETAILNÝ ZÁPIS (paragraf+). Sem patrí kontext, témy, čo sa dohodlo,
+              čo ostalo otvorené. Toto je hlavný obsah, nie summary.
+    topics — JSON array tém: '["pricing", "Q2 launch", "hiring"]'
+    key_points — JSON array kľúčových bodov: '["dohodli sme 15% zľavu", "deadline 30.4."]'
+    sentiment — positive / neutral / negative / mixed
+    follow_up — voľný text čo treba urobiť po (zvážiť aj ctx_add_note action_item)
+    duration_minutes — dĺžka v minútach (pri meeting/call vždy)
+    date — YYYY-MM-DD (default = dnes)
+    person_name — meno; ak je v DB, person_id sa auto-resolve cez fuzzy match
+    domain — work (default) / personal / family / health / finance / home / education
+    """
     data = InteractionInput(
         person_id=person_id, person_name=person_name, channel=channel,
         direction=direction, summary=summary, details=details,
@@ -319,6 +365,118 @@ def ctx_log(
         context=context, date=date, source_ref=source_ref, domain=domain,
     )
     return db.log_interaction(data.model_dump(exclude_none=True))
+
+
+# --- Advanced search (Layer 4) ---
+
+@mcp.tool()
+def ctx_search(
+    query: str | None = None,
+    table: str | None = None,
+    domain: str | None = None,
+    category: str | None = None,
+    tags_any: list[str] | None = None,
+    tags_all: list[str] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    person: str | None = None,
+    sort: str = "relevance",
+    limit: int = 20,
+) -> dict:
+    """Štruktúrovaný search nad notes/interactions/people s presnými filtrami.
+
+    Použij, keď ctx_find vráti príliš veľa výsledkov a chceš zúžiť cez:
+    konkrétny domain, category, časový rozsah, osoba, alebo set tagov.
+
+    Argumenty:
+      query: full-text vyhľadávanie (FTS5, BM25 ranking)
+      table: 'notes' | 'interactions' | 'people' (default = všetky 3)
+      domain: filter podľa domény
+      category: filter podľa kategórie (alias sa normalizuje)
+      tags_any: list tagov — match ak ASPOŇ JEDEN tag matchuje
+      tags_all: list tagov — match LEN ak VŠETKY tagy matchujú
+      date_from / date_to: '2026-01-01' format, filter na created_at/date
+      person: meno osoby (notes → cez related_person_id, interactions → person_name)
+      sort: 'relevance' (BM25) | 'recent' | 'oldest'
+      limit: max počet per tabuľka (default 20)
+
+    Príklady:
+      ctx_search(person='Peter Ďurák', date_from='2026-01-01', table='interactions')
+      ctx_search(category='deal-analysis', tags_all=['Q2-2026'])
+      ctx_search(query='pricing', tags_any=['enterprise', '@kamil-aujesky'])
+
+    Vracia výsledky so `_snippet` (kontext s «matched» highlightom) a `_score`.
+    """
+    return db.search_advanced(
+        query=query, table=table, domain=domain, category=category,
+        tags_any=tags_any, tags_all=tags_all,
+        date_from=date_from, date_to=date_to,
+        person=person, sort=sort, limit=limit,
+    )
+
+
+# --- Categories & vocabulary (Layer 7) ---
+
+@mcp.tool()
+def ctx_categories() -> dict:
+    """Vráti zoznam povolených category, domain, sentiment, channel atď.
+
+    Vždy zavolaj PRED ctx_add_note ak nie si si istý akú category použiť.
+    Ak použiješ neoficiálnu category, automaticky sa normalizuje (napr.
+    'meeting' → 'meeting-notes') alebo skončí ako 'other'. Lepšie použiť
+    canonical priamo.
+    """
+    return db.categories_list()
+
+
+# --- Health & hygiene (Layer 6) ---
+
+@mcp.tool()
+def ctx_health() -> dict:
+    """Coverage report — koľko záznamov má vyplnené metadáta a koľko nie.
+
+    Použij periodicky (napr. týždenne) aby si videl degradáciu kvality DB.
+    Vracia per-tabuľka: missing_domain, missing_category, missing_tags,
+    without_time_marker, missing_details (interactions), atď. + recommendations.
+    """
+    return db.health_report()
+
+
+@mcp.tool()
+def ctx_dedupe(table: str = "notes", threshold: float = 0.85) -> dict:
+    """Nájde pravdepodobné duplicity v tabuľke (notes / people / companies).
+
+    threshold: 0.0-1.0, fuzzy match score (default 0.85 = vysoká istota).
+    Pre people: aj rovnaký email = duplicita istá.
+    Vráti zoznam párov s id_a, id_b, score — neslučuje automaticky.
+    """
+    return db.find_duplicates(table=table, threshold=threshold)
+
+
+@mcp.tool()
+def ctx_orphans() -> dict:
+    """Nájde záznamy bez správnych väzieb:
+    - notes bez related_person_id ani related_project_id
+    - interactions bez person_id (ale s person_name)
+    - active people bez company_id
+    """
+    return db.find_orphans()
+
+
+@mcp.tool()
+def ctx_backfill_metadata(dry_run: bool = False) -> dict:
+    """One-time migration: doplní chýbajúce metadáta v existujúcich záznamoch.
+
+    Konkrétne:
+    1. Normalizuje category aliasy (meeting → meeting-notes, ops/chat-summary → ops-summary, ...)
+    2. Doplní time marker do tagov (z created_at, ak chýba)
+    3. Doplní domain z category mapping (ak chýba)
+    4. Auto-link mentioned people v notes content → related_person_id
+    5. Resolve missing person_id v interactions cez fuzzy name match
+
+    dry_run=True → ukáže čo by spravil bez zápisu. Bezpečné spustiť.
+    """
+    return db.backfill_metadata(dry_run=dry_run)
 
 
 # --- Statistics & maintenance ---
