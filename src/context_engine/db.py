@@ -1562,6 +1562,133 @@ def get_meeting_participants(interaction_id: int | None = None, person_id: int |
         return {"error": "Provide interaction_id or person_id"}
 
 
+def bulk_import(data: dict, on_duplicate: str = "skip", db_path: str | None = None) -> dict:
+    """Bulk import records from a JSON dict.
+
+    data: dict with keys matching table names (people, companies, projects, products, rules, notes).
+          Each value is a list of record dicts.
+    on_duplicate: 'skip' (default) — skip duplicates, 'update' — update existing record.
+
+    Returns summary with counts per table.
+    """
+    valid_import_tables = {"people", "companies", "projects", "products", "rules", "notes"}
+    unknown = set(data.keys()) - valid_import_tables
+    if unknown:
+        return {"status": "error", "error": f"Unknown tables: {unknown}. Valid: {valid_import_tables}"}
+
+    summary = {}
+    # Import companies first (people may reference them via company_name)
+    ordered_tables = ["companies", "projects", "products", "rules", "notes", "people"]
+    tables_to_import = [t for t in ordered_tables if t in data]
+
+    for table in tables_to_import:
+        records = data[table]
+        if not isinstance(records, list):
+            summary[table] = {"error": "Expected a list of records"}
+            continue
+
+        added = 0
+        skipped = 0
+        updated = 0
+        errors = 0
+
+        for record in records:
+            if not isinstance(record, dict):
+                errors += 1
+                continue
+
+            # Strip read-only fields that come from export
+            for field in ("id", "created_at", "first_seen", "updated_at"):
+                record.pop(field, None)
+
+            # Validate required fields
+            if table in ("people",) and "name" not in record:
+                errors += 1
+                continue
+            if table in ("companies",) and "name" not in record:
+                errors += 1
+                continue
+            if table in ("rules",) and ("context" not in record or "rule" not in record):
+                errors += 1
+                continue
+            if table in ("notes",) and "title" not in record:
+                errors += 1
+                continue
+            if table in ("projects", "products") and "name" not in record:
+                errors += 1
+                continue
+
+            if table == "notes":
+                result = add_note(record, db_path)
+            else:
+                result = add_record(table, record, db_path)
+
+            if result.get("status") == "ok":
+                added += 1
+            elif result.get("status") == "duplicate":
+                if on_duplicate == "update" and table != "notes":
+                    # Find existing record to update
+                    existing_id = _find_existing_id(table, record, db_path)
+                    if existing_id:
+                        update_record(table, existing_id, record, db_path)
+                        updated += 1
+                    else:
+                        skipped += 1
+                else:
+                    skipped += 1
+            else:
+                errors += 1
+
+        summary[table] = {"added": added, "skipped": skipped, "updated": updated, "errors": errors}
+
+    total_added = sum(s.get("added", 0) for s in summary.values() if isinstance(s, dict))
+    total_skipped = sum(s.get("skipped", 0) for s in summary.values() if isinstance(s, dict))
+    total_updated = sum(s.get("updated", 0) for s in summary.values() if isinstance(s, dict))
+    total_errors = sum(s.get("errors", 0) for s in summary.values() if isinstance(s, dict))
+
+    return {
+        "status": "ok",
+        "total_added": total_added,
+        "total_skipped": total_skipped,
+        "total_updated": total_updated,
+        "total_errors": total_errors,
+        "tables": summary,
+    }
+
+
+def _find_existing_id(table: str, record: dict, db_path: str | None = None) -> int | None:
+    """Find existing record ID for duplicate resolution."""
+    with get_db(db_path) as db:
+        if table == "people":
+            name = record.get("name", "")
+            email = record.get("email")
+            if email:
+                row = db.execute("SELECT id FROM people WHERE email = ? LIMIT 1", (email,)).fetchone()
+                if row:
+                    return row["id"]
+            row = db.execute("SELECT id FROM people WHERE name = ? LIMIT 1", (name,)).fetchone()
+            if row:
+                return row["id"]
+        elif table == "companies":
+            row = db.execute("SELECT id FROM companies WHERE name = ? LIMIT 1", (record.get("name", ""),)).fetchone()
+            if row:
+                return row["id"]
+        elif table == "projects":
+            row = db.execute("SELECT id FROM projects WHERE name = ? LIMIT 1", (record.get("name", ""),)).fetchone()
+            if row:
+                return row["id"]
+        elif table == "products":
+            row = db.execute("SELECT id FROM products WHERE name = ? LIMIT 1", (record.get("name", ""),)).fetchone()
+            if row:
+                return row["id"]
+        elif table == "rules":
+            row = db.execute("SELECT id FROM rules WHERE context = ? AND rule = ? LIMIT 1",
+                             (record.get("context", ""), record.get("rule", ""))).fetchone()
+            if row:
+                return row["id"]
+    return None
+
+
 def export_data(domain: str | None = None, db_path: str | None = None) -> dict:
     """Export entire register as JSON."""
     d_sql, d_params = _domain_filter(domain)

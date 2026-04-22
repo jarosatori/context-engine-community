@@ -576,6 +576,17 @@ def ctx_export(domain: str | None = None) -> dict:
     return db.export_data(domain)
 
 
+# --- Bulk import ---
+
+@mcp.tool()
+def ctx_import(data: dict, on_duplicate: str = "skip") -> dict:
+    """Bulk import zaznamov z JSON. data je dict s klucmi: people, companies, projects, products, rules, notes.
+    Kazda hodnota je list dictov (rovnaky format ako vystup ctx_export).
+    on_duplicate: 'skip' (default) — preskoci duplicity, 'update' — aktualizuje existujuce.
+    Priklad: {"people": [{"name": "Jan Novak", "email": "jan@test.sk"}], "companies": [{"name": "Firma SK"}]}"""
+    return db.bulk_import(data, on_duplicate)
+
+
 # --- DB Restore (for Railway deployment) ---
 
 @mcp.tool()
