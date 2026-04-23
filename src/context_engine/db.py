@@ -1202,7 +1202,11 @@ def update_record(table: str, record_id: int, data: dict, db_path: str | None = 
                 merged = list(dict.fromkeys(current + new_aliases))
                 data["aliases"] = json.dumps(merged, ensure_ascii=False)
 
-        data["updated_at"] = datetime.now().isoformat()
+        # Set updated_at LEN ak tabuľka má taký stĺpec (interactions/meeting_participants nemajú)
+        table_cols = {row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "updated_at" in table_cols:
+            data["updated_at"] = datetime.now().isoformat()
+
         set_clause = ", ".join([f"{k} = ?" for k in data.keys()])
         values = list(data.values()) + [int(record_id)]
 
