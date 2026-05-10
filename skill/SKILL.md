@@ -267,6 +267,8 @@ Ak si nie si istý → použi "work" pre pracovné, "personal" pre ostatné.
 |------|------|----------|
 | `ctx_find(query, domain?)` | Hľadáš čokoľvek | Výsledky zo všetkých tabuliek (hľadá aj v aliasoch a prezývkach). Notes a interactions vracajú `_snippet` s «match» highlightom + `_score` (BM25) |
 | `ctx_search(query?, table?, domain?, category?, tags_any?, tags_all?, date_from?, date_to?, person?, sort?)` | Štruktúrovaný search s filtrami | Použij keď ctx_find vráti príliš veľa, alebo hľadáš v konkrétnom časovom rozsahu / podľa osoby / kategórie |
+| `ctx_search_semantic(query, table?, limit?, hybrid?)` | **Sémantický search** cez Voyage AI embeddings + sqlite-vec | Pre koncepty, parafrázy, cross-language ("frustrácia s deadline" → nájde aj "stres pred odovzdávkou"). hybrid=True (default) kombinuje s BM25 cez RRF. Pre exact-match keywords stačí ctx_find. |
+| `ctx_find_similar(table, record_id, limit?, cross_table?)` | "Nájdi podobné" cez embedding similarity | "Aké iné notes sú podobné tejto?", "Aké meetingy sú podobné?", cross_table=True hľadá naprieč všetkými embeddable tabuľkami |
 | `ctx_categories()` | Pred ctx_add_note ak nevieš akú category | Plný zoznam povolených category, domains, channels, sentiments + aliasy |
 | `ctx_context(query)` | **PRED emailom/správou** | Formality, tón, jazyk, firma, interakcie, pravidlá |
 | `ctx_person(query)` | Potrebuješ detail osoby | Údaje + interakcie + projekty + pravidlá + action items + meetingy. Podporuje prezývky ("Samo" → "Samuel") a fuzzy matching priezvisk ("Schovajsa" → "Skovajsa") |
@@ -307,7 +309,8 @@ Ak si nie si istý → použi "work" pre pracovné, "personal" pre ostatné.
 | `ctx_stale(days?, domain?)` | Zastarané záznamy |
 | `ctx_recent(days?, domain?)` | Posledné zmeny |
 | `ctx_export(domain?)` | Export celého registra |
-| `ctx_health()` | Coverage report — % záznamov s/bez metadát + recommendations |
+| `ctx_health()` | Coverage report — % záznamov s/bez metadát + embedding stats + recommendations |
+| `ctx_index_embeddings(table?, force_reindex?, limit?)` | Backfill Voyage embeddings pre existujúce records (auto-embed beží pri každom INSERT/UPDATE) |
 | `ctx_dedupe(table, threshold?)` | Nájde pravdepodobné duplicity (notes/people/companies) |
 | `ctx_orphans()` | Nájde záznamy bez správnych väzieb (notes bez person link, atď.) |
 | `ctx_backfill_metadata(dry_run?)` | One-time migration — normalizuje categories, doplní time markery, person linky |

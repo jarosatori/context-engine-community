@@ -11,6 +11,12 @@ dependencies = [
     "mcp>=1.0",
     "pydantic>=2.0",
     "mcp-oauth>=0.0.6",
+    "sqlite-vec>=0.1.6",
+    "voyageai>=0.3.2",
+    # pysqlite3 — modern SQLite with extension support (stdlib sqlite3 on macOS lacks it)
+    # Linux gets the binary wheel; macOS builds from source (sqlite headers via Xcode CLT).
+    "pysqlite3-binary>=0.5.4; platform_system == 'Linux'",
+    "pysqlite3>=0.5.4; platform_system == 'Darwin'",
 ]
 
 [project.scripts]

@@ -429,17 +429,94 @@ def ctx_categories() -> dict:
     return db.categories_list()
 
 
+# --- Semantic search (Layer 8) ---
+
+@mcp.tool()
+def ctx_search_semantic(
+    query: str,
+    table: str | None = None,
+    limit: int = 10,
+    hybrid: bool = True,
+) -> dict:
+    """Sémantický search cez Voyage AI embeddings + sqlite-vec.
+
+    Použij pre koncepty, parafrázy, cross-language queries, "ten typ obsahu kde...".
+    Pre exact-match keywords stačí ctx_find / ctx_search.
+
+    PRÍKLADY:
+      ctx_search_semantic("frustrácia s deadlinom") — nájde aj "stres pred odovzdávkou", "tlak"
+      ctx_search_semantic("hiring senior dev", table="notes") — nájde aj "recruiting CTO"
+      ctx_search_semantic("Q2 priority", hybrid=True) — semantic + BM25 fused
+
+    Args:
+      query: free-text query (slovenčina aj angličtina)
+      table: 'notes' | 'interactions' | 'people' | 'companies' | 'projects' | None (všetko)
+      limit: max results per table
+      hybrid: True (default) → kombinuje s FTS5 BM25 cez Reciprocal Rank Fusion (lepšie precision+recall).
+              False → čistý semantic.
+
+    Returns: results per table s `_semantic_score`, `_bm25_score`, `_fused_score`, `_snippet`.
+    """
+    return db.search_semantic(query=query, table=table, limit=limit, hybrid=hybrid)
+
+
+@mcp.tool()
+def ctx_find_similar(table: str, record_id: int, limit: int = 5,
+                     cross_table: bool = False) -> dict:
+    """Nájdi podobné records k danému (cez embedding similarity).
+
+    Použij keď chceš objaviť súvisiace veci — napr. "ďalšie notes podobné tejto",
+    "iní ľudia podobní tomuto klientovi", "podobné meetingy v minulosti".
+
+    Args:
+      table: 'notes' | 'interactions' | 'people' | 'companies' | 'projects'
+      record_id: ID source recordu
+      limit: max výsledkov per cieľová tabuľka
+      cross_table: True → hľadaj naprieč všetkými embeddable tabuľkami;
+                   False (default) → len v tej istej tabuľke
+
+    Returns: results per table s `_similarity` score (0-1, vyššie = bližšie).
+    """
+    return db.find_similar(table=table, row_id=record_id, limit=limit, cross_table=cross_table)
+
+
+@mcp.tool()
+def ctx_index_embeddings(table: str | None = None,
+                          force_reindex: bool = False,
+                          limit: int | None = None) -> dict:
+    """One-time / periodický backfill — vyrobí Voyage embeddings pre existujúce records.
+
+    Pri normálnej prevádzke nie je potrebný — `ctx_add_note`, `ctx_log`,
+    `ctx_add_person` automaticky vyrábajú embeddings pri INSERT/UPDATE.
+
+    Tento tool je na:
+    1. Initial setup po deployi (embed všetkých starých records)
+    2. Po zmene embedding modelu (force_reindex=True)
+    3. Po batch importe ktorý obišiel auto-hook
+
+    Args:
+      table: konkrétna tabuľka alebo None (všetky embeddable: notes, interactions, people, companies, projects)
+      force_reindex: True → re-embed aj records ktoré už majú aktuálny embedding (zmena modelu)
+      limit: max records na batch (užitočné pre dry-run / postupné spracovanie)
+
+    Cena: ~$0.02 per 1500 records s voyage-3-large. Idempotentné.
+    """
+    return db.index_embeddings(table=table, force_reindex=force_reindex, limit=limit)
+
+
 # --- Health & hygiene (Layer 6) ---
 
 @mcp.tool()
 def ctx_health() -> dict:
-    """Coverage report — koľko záznamov má vyplnené metadáta a koľko nie.
+    """Coverage report — koľko záznamov má vyplnené metadáta + embedding stats.
 
     Použij periodicky (napr. týždenne) aby si videl degradáciu kvality DB.
     Vracia per-tabuľka: missing_domain, missing_category, missing_tags,
-    without_time_marker, missing_details (interactions), atď. + recommendations.
+    without_time_marker, missing_details (interactions), embedding coverage, atď.
     """
-    return db.health_report()
+    metadata = db.health_report()
+    metadata["embeddings"] = db.embeddings_stats()
+    return metadata
 
 
 @mcp.tool()

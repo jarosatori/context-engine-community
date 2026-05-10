@@ -215,7 +215,7 @@ Nie — DB je mimo repa (`~/.context-engine/` lokálne, `/data` volume na Railwa
 
 ## Čo dostávaš (technické zhrnutie)
 
-**36 MCP toolov s prefixom `ctx_*`:**
+**39 MCP toolov s prefixom `ctx_*`:**
 - **Ľudia:** `ctx_add_person`, `ctx_person`, `ctx_find` (FTS5 full-text + alias + fuzzy)
 - **Firmy:** `ctx_add_company`, `ctx_company`
 - **Projekty:** `ctx_add_project`, `ctx_project`, `ctx_meeting_participants`
@@ -224,25 +224,35 @@ Nie — DB je mimo repa (`~/.context-engine/` lokálne, `/data` volume na Railwa
 - **Poznámky:** `ctx_add_note` (s validáciou + dedupe warning), `ctx_find_notes`, `ctx_get_note`
 - **Interakcie & kontext:** `ctx_log` (rich fields: details/topics/key_points/sentiment/follow_up/duration), `ctx_context`, `ctx_recent`
 - **Action items & rozhodnutia:** `ctx_action_items`, `ctx_mark_action_done`, `ctx_decisions`
-- **Smart search (NEW):** `ctx_search` (structured filters: category, tags_any/all, date range, person, sort)
-- **Vocabulary (NEW):** `ctx_categories` — controlled vocabulary (40 categories + 51 aliases)
-- **Hygiene (NEW):** `ctx_health` (coverage report), `ctx_dedupe`, `ctx_orphans`, `ctx_backfill_metadata`, `ctx_populate_aliases`
+- **Search:** `ctx_search` (structured filters: category, tags_any/all, date range, person, sort)
+- **Sémantický search (NEW v0.5):** `ctx_search_semantic` (Voyage AI embeddings + RRF hybrid), `ctx_find_similar` (nearest neighbors), `ctx_index_embeddings` (backfill)
+- **Vocabulary:** `ctx_categories` — controlled vocabulary (40 categories + 51 aliases)
+- **Hygiene:** `ctx_health` (coverage + embedding stats), `ctx_dedupe`, `ctx_orphans`, `ctx_backfill_metadata`, `ctx_populate_aliases`
 - **Údržba & stats:** `ctx_stats`, `ctx_incomplete`, `ctx_stale`, `ctx_update`, `ctx_export`, `ctx_restore_db`
 - **Scany:** `ctx_scan_status`, `ctx_set_scan`, `ctx_update_scan`
 - **Init:** `ctx_init`
 
 **Storage:**
 - SQLite s **FTS5** (full-text search nad people, projects, notes, companies, interactions)
+- **sqlite-vec** virtual table pre embedding storage (Voyage AI vectors, 1024 dim)
 - Soft-delete cez `status = 'inactive'` (nikdy skutočne nemaže)
 - 7 domén: `work`, `personal`, `home`, `health`, `finance`, `family`, `education`
 - Pydantic validácia vstupov + **server-side validation** s helpful errors (kód `VALIDATION_FAILED` + hints)
 
-**Knowledge quality (NEW):**
+**Knowledge quality:**
 - **Required fields enforcement** — `ctx_add_note` vyžaduje title/content/domain/category/tags/source; `ctx_log` vyžaduje channel + summary/details
 - **Auto-enrichment** — category aliasy sa normalizujú (`meeting` → `meeting-notes`), domain sa derivuje z category, time markery (`2026-W17`) sa pridajú do tagov, mentioned people sa auto-link-nú
-- **Smart search results** — notes a interactions vracajú `_snippet` (FTS5 snippet s `«match»` highlightom) + `_score` (BM25 ranking)
+- **Lexical search** — notes a interactions vracajú `_snippet` (FTS5 snippet s `«match»` highlightom) + `_score` (BM25 ranking)
+- **Sémantický search (v0.5+)** — Voyage AI embeddings + sqlite-vec; cross-language SK↔EN, koncept search, "frustrácia s deadline" nájde aj "stres pred odovzdávkou". Hybrid mode kombinuje BM25 + semantic cez Reciprocal Rank Fusion.
+- **Auto-embed** — pri každom `ctx_add_note`/`ctx_log`/`ctx_add_person` sa text auto-embedne (best-effort, neblokuje insert)
 - **Dedupe warning** — pred pridaním novej note sa skontroluje či neexistuje podobná
 - **Slovak nicknames** — 118 mien v dictionary, diakritika-tolerant matching ("Frantisek" nájde "František Novák")
+
+**Voyage AI setup (pre semantic search):**
+- Sign up na https://www.voyageai.com/, pridaj billing card (zostáva 200M tokens free)
+- Nastav env var `VOYAGE_API` (alebo `VOYAGE_API_KEY`/`VOYAGE_KEY`/`VOYAGEAI_API_KEY`)
+- Default model: `voyage-3-large` (1024 dims, najlepšia kvalita). Override cez `VOYAGE_MODEL` env var.
+- Initial backfill 1500 records: ~30s, ~$0.02 (jednorazovo)
 
 **Rozhrania:**
 - **MCP server** (stdio pre Claude Code lokálne, **SSE s OAuth** pre Cowork + remote agentov)

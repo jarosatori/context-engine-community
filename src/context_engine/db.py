@@ -1,14 +1,25 @@
 """SQLite database layer for Context Engine."""
 
 import json
-import sqlite3
 import os
+import re
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import contextmanager
-
-import re
 from difflib import SequenceMatcher
+
+# Prefer pysqlite3 (modern SQLite + extension support); fallback to stdlib.
+# Stdlib sqlite3 on macOS lacks enable_load_extension, so sqlite-vec won't load.
+try:
+    import pysqlite3 as sqlite3
+    _SQLITE_HAS_EXTENSIONS = True
+except ImportError:
+    import sqlite3
+    _SQLITE_HAS_EXTENSIONS = hasattr(sqlite3.Connection, "enable_load_extension")
+
+logger = logging.getLogger(__name__)
+
 from context_engine.nicknames import expand_query_names, surname_similarity, FUZZY_THRESHOLD
 from context_engine.schema_meta import (
     DOMAINS, CATEGORIES, CATEGORY_ALIASES, DOMAIN_FROM_CATEGORY,
@@ -16,6 +27,15 @@ from context_engine.schema_meta import (
     REQUIRED_FIELDS, RECOMMENDED_FIELDS,
     normalize_category, has_time_marker, auto_time_marker, quarter_marker,
 )
+
+# Embedding layer (lazy — Voyage API key môže chýbať)
+try:
+    from context_engine import embeddings as _emb
+    _EMBEDDINGS_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Embeddings module not available: {e}")
+    _EMBEDDINGS_AVAILABLE = False
+    _emb = None
 
 DB_PATH = os.environ.get("CTX_DB", str(Path.home() / ".context-engine" / "context-engine.db"))
 
@@ -377,15 +397,43 @@ CREATE INDEX IF NOT EXISTS idx_mp_interaction ON meeting_participants(interactio
 SCAN_SOURCES = ["gmail", "slack", "asana", "drive", "calendar"]
 
 
+def _load_sqlite_vec(db) -> bool:
+    """Load sqlite-vec extension. Returns True if loaded successfully.
+
+    On macOS stdlib sqlite3, enable_load_extension is missing. Caller should
+    handle False gracefully (semantic search disabled, FTS5 still works).
+    """
+    if not _SQLITE_HAS_EXTENSIONS:
+        return False
+    try:
+        import sqlite_vec
+        db.enable_load_extension(True)
+        sqlite_vec.load(db)
+        db.enable_load_extension(False)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load sqlite-vec: {e}")
+        try:
+            db.enable_load_extension(False)
+        except Exception:
+            pass
+        return False
+
+
 @contextmanager
 def get_db(db_path: str | None = None):
-    """Context manager for database connections."""
+    """Context manager for database connections.
+
+    Loads sqlite-vec extension if available — silently skipped if not (allows
+    DB to work without semantic search on platforms without extension support).
+    """
     path = db_path or DB_PATH
     os.makedirs(os.path.dirname(path), exist_ok=True)
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA foreign_keys=ON")
+    _load_sqlite_vec(db)  # best-effort
     try:
         yield db
         db.commit()
@@ -453,6 +501,33 @@ def _migrate(db) -> None:
     except Exception:
         pass
 
+    # Migration v5: embedding storage (sqlite-vec) — added 2026-04-24
+    # Skip silently if sqlite-vec isn't loaded (e.g. macOS without pysqlite3)
+    try:
+        # vec0 virtual table for raw embeddings
+        db.execute(f"""
+            CREATE VIRTUAL TABLE IF NOT EXISTS embeddings USING vec0(
+                id INTEGER PRIMARY KEY,
+                embedding FLOAT[1024]
+            )
+        """)
+        # Mapping table — which CE row this embedding represents
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS embedding_index (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name TEXT NOT NULL,
+                row_id INTEGER NOT NULL,
+                text_hash TEXT NOT NULL,
+                model TEXT NOT NULL,
+                embedding_id INTEGER,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(table_name, row_id, model)
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_embedding_index_lookup ON embedding_index(table_name, row_id)")
+    except Exception as e:
+        logger.warning(f"sqlite-vec migration skipped: {e}")
+
 
 def init_db(db_path: str | None = None) -> dict:
     """Create database with full schema."""
@@ -461,7 +536,7 @@ def init_db(db_path: str | None = None) -> dict:
         _migrate(db)
         for source in SCAN_SOURCES:
             db.execute("INSERT OR IGNORE INTO scan_log (source) VALUES (?)", (source,))
-        db.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (4)")
+        db.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (5)")
     return {"status": "ok", "message": "Database initialized", "path": db_path or DB_PATH}
 
 
@@ -1165,9 +1240,24 @@ def add_record(table: str, data: dict, db_path: str | None = None,
     with get_db(db_path) as db:
         try:
             cursor = db.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", values)
-            result = {"status": "ok", "id": cursor.lastrowid, "table": table}
+            new_id = cursor.lastrowid
+            result = {"status": "ok", "id": new_id, "table": table}
             if warnings:
                 result["warnings"] = warnings
+
+            # Auto-embed (best-effort, never blocks the insert)
+            if table in EMBEDDABLE_TABLES:
+                try:
+                    emb_res = _embed_and_store(db, table, new_id)
+                    if emb_res.get("status") in ("indexed", "updated"):
+                        result["embedding"] = emb_res["status"]
+                    elif emb_res.get("status") == "error":
+                        result.setdefault("warnings", []).append(
+                            f"embedding failed: {emb_res.get('reason')}"
+                        )
+                except Exception as e:
+                    result.setdefault("warnings", []).append(f"embedding hook error: {e}")
+
             return result
         except sqlite3.IntegrityError as e:
             if "UNIQUE constraint" in str(e):
@@ -1213,7 +1303,16 @@ def update_record(table: str, record_id: int, data: dict, db_path: str | None = 
         db.execute(f"UPDATE {table} SET {set_clause} WHERE id = ?", values)
         updated = db.execute(f"SELECT * FROM {table} WHERE id = ?", (int(record_id),)).fetchone()
         if updated:
-            return {"status": "ok", "record": dict(updated)}
+            result = {"status": "ok", "record": dict(updated)}
+            # Re-embed if content changed (auto-detect via text_hash)
+            if table in EMBEDDABLE_TABLES:
+                try:
+                    emb_res = _embed_and_store(db, table, int(record_id))
+                    if emb_res.get("status") in ("indexed", "updated"):
+                        result["embedding"] = emb_res["status"]
+                except Exception as e:
+                    result["embedding_warning"] = str(e)
+            return result
         return {"status": "error", "message": f"Record {record_id} not found in {table}"}
 
 
@@ -2015,3 +2114,412 @@ def categories_list() -> dict:
             "Ak je category alias (napr. 'meeting'), automaticky sa normalizuje na canonical ('meeting-notes')."
         ),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Semantic search layer (sqlite-vec + Voyage AI embeddings)
+# ─────────────────────────────────────────────────────────────────────
+
+# Tabuľky ktoré chceme indexovať pre semantic search
+EMBEDDABLE_TABLES = {"notes", "interactions", "people", "companies", "projects"}
+
+
+def _vec_supported(db) -> bool:
+    """Test či vec0 tabuľka existuje (sqlite-vec loaded + migration prebehla)."""
+    try:
+        db.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone()
+        return True
+    except Exception:
+        return False
+
+
+def _embed_and_store(db, table: str, row_id: int, *, model: str | None = None) -> dict:
+    """Vyrobí embedding pre daný record (cez build_embedding_text), uloží do vec0.
+    Idempotentné cez text_hash — re-embed len ak sa text zmenil."""
+    if not _EMBEDDINGS_AVAILABLE or not _emb:
+        return {"status": "skipped", "reason": "embeddings module unavailable"}
+
+    if table not in EMBEDDABLE_TABLES:
+        return {"status": "skipped", "reason": f"table {table} not embeddable"}
+
+    if not _vec_supported(db):
+        return {"status": "skipped", "reason": "sqlite-vec not loaded"}
+
+    if not _emb.is_available():
+        return {"status": "skipped", "reason": "VOYAGE_API not set"}
+
+    model = model or _emb.DEFAULT_MODEL
+
+    # Fetch the row
+    row = db.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)).fetchone()
+    if not row:
+        return {"status": "error", "reason": f"row {table}:{row_id} not found"}
+
+    text = _emb.build_embedding_text(table, dict(row))
+    if not text or len(text) < 3:
+        return {"status": "skipped", "reason": "empty text"}
+
+    new_hash = _emb.text_hash(text)
+
+    # Check existing — skip if hash matches
+    existing = db.execute(
+        "SELECT id, text_hash, embedding_id FROM embedding_index WHERE table_name = ? AND row_id = ? AND model = ?",
+        (table, row_id, model)
+    ).fetchone()
+
+    if existing and existing["text_hash"] == new_hash:
+        return {"status": "skipped", "reason": "hash match", "embedding_id": existing["embedding_id"]}
+
+    # Embed (single API call)
+    try:
+        vector = _emb.embed_single(text, model=model, input_type="document")
+    except Exception as e:
+        return {"status": "error", "reason": f"voyage embed failed: {e}"}
+
+    blob = _emb.serialize_vector(vector)
+
+    if existing:
+        # Update existing embedding — replace vec0 row + update mapping hash
+        db.execute("UPDATE embeddings SET embedding = ? WHERE id = ?", (blob, existing["embedding_id"]))
+        db.execute(
+            "UPDATE embedding_index SET text_hash = ?, created_at = ? WHERE id = ?",
+            (new_hash, datetime.now().isoformat(), existing["id"])
+        )
+        return {"status": "updated", "embedding_id": existing["embedding_id"]}
+    else:
+        # New embedding — insert into vec0 (auto id), then mapping
+        cur = db.execute("INSERT INTO embeddings(embedding) VALUES (?)", (blob,))
+        emb_id = cur.lastrowid
+        db.execute(
+            "INSERT INTO embedding_index(table_name, row_id, text_hash, model, embedding_id) VALUES (?, ?, ?, ?, ?)",
+            (table, row_id, new_hash, model, emb_id)
+        )
+        return {"status": "indexed", "embedding_id": emb_id}
+
+
+def index_embeddings(table: str | None = None, force_reindex: bool = False,
+                     limit: int | None = None, batch_size: int = 64,
+                     db_path: str | None = None) -> dict:
+    """Backfill embeddings pre existujúce records. Idempotentné.
+
+    Batch-aware: posiela až `batch_size` textov per Voyage API call (max 128),
+    čo je 100× rýchlejšie na rate-limited free tier.
+
+    table=None → všetky EMBEDDABLE_TABLES.
+    force_reindex=True → pre-embed aj keď text_hash matchuje (zmena modelu).
+    limit → max N records na batch (užitočné pre dry runs).
+    batch_size → koľko textov per Voyage API call (default 64, max 128).
+    """
+    if not _EMBEDDINGS_AVAILABLE:
+        return {"status": "error", "reason": "embeddings module unavailable"}
+
+    batch_size = max(1, min(int(batch_size), 128))
+    targets = [table] if table else sorted(EMBEDDABLE_TABLES)
+    stats = {"per_table": {}, "total_indexed": 0, "total_updated": 0,
+             "total_skipped": 0, "total_errors": 0, "first_errors": []}
+
+    with get_db(db_path) as db:
+        if not _vec_supported(db):
+            return {"status": "error", "reason": "sqlite-vec not loaded — install pysqlite3 + sqlite-vec"}
+        if not _emb.is_available():
+            return {"status": "error", "reason": "VOYAGE_API env var not set"}
+
+        model = _emb.DEFAULT_MODEL
+
+        for tbl in targets:
+            if tbl not in EMBEDDABLE_TABLES:
+                continue
+            sql = f"SELECT * FROM {tbl}"
+            if limit:
+                sql += f" LIMIT {int(limit)}"
+            rows = db.execute(sql).fetchall()
+
+            indexed = updated = skipped = errors = 0
+            first_error_examples: list[dict] = []
+
+            # Pre-compute texts + check existing hashes
+            pending: list[tuple[int, str, str]] = []  # (row_id, text, hash)
+            for row in rows:
+                rid = row["id"]
+
+                if force_reindex:
+                    existing = db.execute(
+                        "SELECT embedding_id FROM embedding_index WHERE table_name = ? AND row_id = ?",
+                        (tbl, rid)
+                    ).fetchone()
+                    if existing:
+                        db.execute("DELETE FROM embeddings WHERE id = ?", (existing["embedding_id"],))
+                        db.execute("DELETE FROM embedding_index WHERE table_name = ? AND row_id = ?",
+                                   (tbl, rid))
+
+                text = _emb.build_embedding_text(tbl, dict(row))
+                if not text or len(text) < 3:
+                    skipped += 1
+                    continue
+                new_hash = _emb.text_hash(text)
+
+                # Skip if hash matches existing (idempotent)
+                existing = db.execute(
+                    "SELECT text_hash FROM embedding_index WHERE table_name = ? AND row_id = ? AND model = ?",
+                    (tbl, rid, model)
+                ).fetchone()
+                if existing and existing["text_hash"] == new_hash:
+                    skipped += 1
+                    continue
+
+                pending.append((rid, text, new_hash))
+
+            # Batch embed pending
+            for i in range(0, len(pending), batch_size):
+                batch = pending[i : i + batch_size]
+                texts = [b[1] for b in batch]
+                try:
+                    vectors = _emb.embed_texts(texts, model=model, input_type="document")
+                except Exception as e:
+                    errors += len(batch)
+                    if len(first_error_examples) < 5:
+                        first_error_examples.append({
+                            "table": tbl, "batch_size": len(batch),
+                            "reason": f"voyage batch failed: {str(e)[:300]}",
+                        })
+                    continue
+
+                for (rid, _text, new_hash), vector in zip(batch, vectors):
+                    blob = _emb.serialize_vector(vector)
+                    existing = db.execute(
+                        "SELECT id, embedding_id FROM embedding_index WHERE table_name = ? AND row_id = ? AND model = ?",
+                        (tbl, rid, model)
+                    ).fetchone()
+                    try:
+                        if existing:
+                            db.execute("UPDATE embeddings SET embedding = ? WHERE id = ?",
+                                       (blob, existing["embedding_id"]))
+                            db.execute(
+                                "UPDATE embedding_index SET text_hash = ?, created_at = ? WHERE id = ?",
+                                (new_hash, datetime.now().isoformat(), existing["id"])
+                            )
+                            updated += 1
+                        else:
+                            cur = db.execute("INSERT INTO embeddings(embedding) VALUES (?)", (blob,))
+                            emb_id = cur.lastrowid
+                            db.execute(
+                                "INSERT INTO embedding_index(table_name, row_id, text_hash, model, embedding_id) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                (tbl, rid, new_hash, model, emb_id)
+                            )
+                            indexed += 1
+                    except Exception as e:
+                        errors += 1
+                        if len(first_error_examples) < 5:
+                            first_error_examples.append({
+                                "table": tbl, "row_id": rid,
+                                "reason": f"db write failed: {str(e)[:200]}",
+                            })
+
+            stats["per_table"][tbl] = {
+                "total": len(rows), "indexed": indexed, "updated": updated,
+                "skipped": skipped, "errors": errors,
+            }
+            stats["total_indexed"] += indexed
+            stats["total_updated"] += updated
+            stats["total_skipped"] += skipped
+            stats["total_errors"] += errors
+            stats["first_errors"].extend(first_error_examples)
+
+    stats["model"] = _emb.DEFAULT_MODEL
+    stats["batch_size_used"] = batch_size
+    return stats
+
+
+def search_semantic(query: str, table: str | None = None, limit: int = 10,
+                    hybrid: bool = True, db_path: str | None = None) -> dict:
+    """Semantic search — embed query, find nearest vectors, optionally fuse with FTS5.
+
+    Args:
+        query: free text search
+        table: 'notes' | 'interactions' | 'people' | 'companies' | 'projects' | None (all)
+        limit: top N results to return (per table if multi-table)
+        hybrid: if True, fuse with FTS5 BM25 results via Reciprocal Rank Fusion
+
+    Returns dict with `results` per table — each row enriched with
+    `_semantic_score`, optionally `_bm25_score`, `_fused_score`, `_snippet`.
+    """
+    if not _EMBEDDINGS_AVAILABLE:
+        return {"status": "error", "reason": "embeddings module unavailable"}
+
+    targets = [table] if table else sorted(EMBEDDABLE_TABLES)
+    out: dict = {"query": query, "model": _emb.DEFAULT_MODEL, "hybrid": hybrid, "results": {}}
+
+    with get_db(db_path) as db:
+        if not _vec_supported(db):
+            return {"status": "error", "reason": "sqlite-vec not loaded"}
+        if not _emb.is_available():
+            return {"status": "error", "reason": "VOYAGE_API env var not set"}
+
+        try:
+            q_vector = _emb.embed_single(query, input_type="query")
+        except Exception as e:
+            return {"status": "error", "reason": f"voyage embed query failed: {e}"}
+        q_blob = _emb.serialize_vector(q_vector)
+
+        for tbl in targets:
+            if tbl not in EMBEDDABLE_TABLES:
+                continue
+
+            # Top K via vector distance
+            sem_rows = db.execute(f"""
+                SELECT
+                    t.*,
+                    vec_distance_cosine(e.embedding, ?) AS _semantic_distance
+                FROM embeddings e
+                JOIN embedding_index ei ON ei.embedding_id = e.id
+                JOIN {tbl} t ON t.id = ei.row_id
+                WHERE ei.table_name = ?
+                ORDER BY _semantic_distance ASC
+                LIMIT ?
+            """, (q_blob, tbl, limit * 5 if hybrid else limit)).fetchall()
+
+            sem_ranking = [(tbl, r["id"], 1.0 - r["_semantic_distance"]) for r in sem_rows]
+
+            if not hybrid:
+                results = []
+                for r in sem_rows[:limit]:
+                    d = dict(r)
+                    d["_semantic_score"] = round(1.0 - d["_semantic_distance"], 4)
+                    results.append(d)
+                if results:
+                    out["results"][tbl] = results
+                continue
+
+            # Hybrid — fetch BM25 results too
+            bm25_rows = []
+            fts_table = {"notes": "notes_fts", "interactions": "interactions_fts",
+                         "people": "people_fts", "companies": "companies_fts",
+                         "projects": "projects_fts"}.get(tbl)
+            if fts_table:
+                try:
+                    bm25_rows = db.execute(f"""
+                        SELECT t.*,
+                               snippet({fts_table}, -1, '«', '»', '…', 24) AS _snippet,
+                               bm25({fts_table}) AS _bm25
+                        FROM {fts_table} JOIN {tbl} t ON t.id = {fts_table}.rowid
+                        WHERE {fts_table} MATCH ?
+                        ORDER BY _bm25
+                        LIMIT ?
+                    """, (query, limit * 5)).fetchall()
+                except Exception:
+                    bm25_rows = []
+
+            bm25_ranking = [(tbl, r["id"], -r["_bm25"]) for r in bm25_rows]  # negated bm25 = higher better
+
+            # RRF fuse
+            fused = _emb.reciprocal_rank_fusion([sem_ranking, bm25_ranking])
+
+            # Build combined dicts
+            sem_lookup = {r["id"]: r for r in sem_rows}
+            bm25_lookup = {r["id"]: r for r in bm25_rows}
+
+            results = []
+            for _t, rid, fscore in fused[:limit]:
+                row = bm25_lookup.get(rid) or sem_lookup.get(rid)
+                if not row:
+                    continue
+                d = dict(row)
+                if rid in sem_lookup:
+                    d["_semantic_score"] = round(1.0 - sem_lookup[rid]["_semantic_distance"], 4)
+                if rid in bm25_lookup:
+                    d["_bm25_score"] = round(-bm25_lookup[rid]["_bm25"], 4)
+                    if "_snippet" in dict(bm25_lookup[rid]):
+                        d["_snippet"] = bm25_lookup[rid]["_snippet"]
+                d["_fused_score"] = round(fscore, 4)
+                results.append(d)
+
+            if results:
+                out["results"][tbl] = results
+
+    out["total"] = sum(len(v) for v in out["results"].values())
+    return out
+
+
+def find_similar(table: str, row_id: int, limit: int = 5,
+                 cross_table: bool = False, db_path: str | None = None) -> dict:
+    """Nájdi podobné records k danému (cez ich embedding distance).
+
+    cross_table=True → hľadaj naprieč všetkými EMBEDDABLE_TABLES.
+    """
+    if not _EMBEDDINGS_AVAILABLE:
+        return {"status": "error", "reason": "embeddings module unavailable"}
+
+    with get_db(db_path) as db:
+        if not _vec_supported(db):
+            return {"status": "error", "reason": "sqlite-vec not loaded"}
+
+        # Get the source embedding
+        src = db.execute(
+            "SELECT e.id, e.embedding FROM embedding_index ei "
+            "JOIN embeddings e ON e.id = ei.embedding_id "
+            "WHERE ei.table_name = ? AND ei.row_id = ?",
+            (table, row_id)
+        ).fetchone()
+
+        if not src:
+            return {"status": "error", "reason": f"no embedding for {table}:{row_id} — run ctx_index_embeddings"}
+
+        src_blob = src["embedding"]
+        out: dict = {"source": {"table": table, "id": row_id}, "results": {}}
+
+        targets = sorted(EMBEDDABLE_TABLES) if cross_table else [table]
+        for tbl in targets:
+            rows = db.execute(f"""
+                SELECT t.*, vec_distance_cosine(e.embedding, ?) AS _distance
+                FROM embeddings e
+                JOIN embedding_index ei ON ei.embedding_id = e.id
+                JOIN {tbl} t ON t.id = ei.row_id
+                WHERE ei.table_name = ?
+                  AND NOT (ei.table_name = ? AND ei.row_id = ?)
+                ORDER BY _distance ASC
+                LIMIT ?
+            """, (src_blob, tbl, table, row_id, limit)).fetchall()
+
+            if rows:
+                out["results"][tbl] = [
+                    {**dict(r), "_similarity": round(1.0 - r["_distance"], 4)}
+                    for r in rows
+                ]
+
+        return out
+
+
+def embeddings_stats(db_path: str | None = None) -> dict:
+    """Health stats pre embedding layer — koľko records je indexovaných, stale, missing."""
+    out: dict = {"available": _EMBEDDINGS_AVAILABLE,
+                 "voyage_configured": _emb.is_available() if _EMBEDDINGS_AVAILABLE else False,
+                 "model": _emb.DEFAULT_MODEL if _EMBEDDINGS_AVAILABLE else None,
+                 "diagnostic": _emb.diagnostic_info() if _EMBEDDINGS_AVAILABLE else None,
+                 "per_table": {}}
+
+    with get_db(db_path) as db:
+        if not _vec_supported(db):
+            out["sqlite_vec_loaded"] = False
+            return out
+        out["sqlite_vec_loaded"] = True
+
+        total_indexed = db.execute("SELECT COUNT(*) c FROM embedding_index").fetchone()["c"]
+        out["total_indexed"] = total_indexed
+
+        for tbl in sorted(EMBEDDABLE_TABLES):
+            try:
+                total = db.execute(f"SELECT COUNT(*) c FROM {tbl}").fetchone()["c"]
+                indexed = db.execute(
+                    "SELECT COUNT(*) c FROM embedding_index WHERE table_name = ?",
+                    (tbl,)
+                ).fetchone()["c"]
+                out["per_table"][tbl] = {
+                    "total_rows": total,
+                    "indexed": indexed,
+                    "missing": max(0, total - indexed),
+                }
+            except Exception as e:
+                out["per_table"][tbl] = {"error": str(e)}
+
+    return out
