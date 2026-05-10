@@ -83,9 +83,30 @@ def ctx_populate_aliases() -> dict:
 
 @mcp.tool()
 def ctx_find(query: str, domain: str | None = None) -> dict:
-    """Hladaj napriec celou DB (ludia, firmy, projekty, produkty, pravidla, poznamky).
-    Volitelne filtruj podla domeny (work, personal, home, health, finance, family, education)."""
+    """RÝCHLY lexikálny lookup naprieč celou DB (BM25, žiadny API call, <50ms).
+
+    KEDY POUŽIŤ:
+      ✅ Quick lookup známeho keyword/mena (rýchle, lacné, deterministické)
+      ✅ Keď chceš všetko z viacerých tabuliek naraz a ide ti o speed
+
+    KEDY POUŽIŤ INÉ:
+      ❌ Concept query / parafráza / cross-language → ctx_search_semantic
+      ❌ Štruktúrované filtre (date range, category, tags) → ctx_search
+      ❌ Detail jednej osoby/firmy/projektu → ctx_person/ctx_company/ctx_project
+      ❌ Pred písaním emailu → ctx_context (vráti aj formality, tone, rules)
+
+    Volitelne filtruj podla domeny (work, personal, home, health, finance, family, education).
+    """
     return db.find(query, domain)
+
+
+# --- Search decision guide (for Claude) ------------------------------------
+# 1. Poznáš presné meno?         → ctx_person / ctx_company / ctx_project
+# 2. Pred písaním emailu/správy?  → ctx_context  (formality, tone, rules)
+# 3. Štruktúrované filtre?         → ctx_search  (date range, category, tags, person)
+# 4. Concept / "find anything"?   → ctx_search_semantic  (Voyage embeddings + RRF hybrid)
+# 5. "Find similar to this"?       → ctx_find_similar  (nearest neighbors via embedding)
+# 6. Quick keyword lookup?         → ctx_find    (BM25, no API call, fastest)
 
 
 # --- Detail views ---
@@ -383,29 +404,34 @@ def ctx_search(
     sort: str = "relevance",
     limit: int = 20,
 ) -> dict:
-    """Štruktúrovaný search nad notes/interactions/people s presnými filtrami.
+    """ŠTRUKTÚROVANÝ search s presnými filtrami (date range, category, tags, person).
 
-    Použij, keď ctx_find vráti príliš veľa výsledkov a chceš zúžiť cez:
-    konkrétny domain, category, časový rozsah, osoba, alebo set tagov.
+    KEDY POUŽIŤ:
+      ✅ Máš presné filtre — date range, category, tag set, konkrétna osoba
+      ✅ Chceš zúžiť výsledky ktoré ctx_find/ctx_search_semantic vrátili priveľa
+      ✅ "Všetky decisions z Q2-2026", "interactions s Petrom za posledný mesiac"
+
+    KEDY POUŽIŤ INÉ:
+      ❌ Concept query bez filtrov → ctx_search_semantic
+      ❌ Quick keyword lookup → ctx_find
+      ❌ Detail jednej osoby/firmy → ctx_person/ctx_company
 
     Argumenty:
-      query: full-text vyhľadávanie (FTS5, BM25 ranking)
+      query: full-text (FTS5 BM25), volitelne
       table: 'notes' | 'interactions' | 'people' (default = všetky 3)
       domain: filter podľa domény
       category: filter podľa kategórie (alias sa normalizuje)
-      tags_any: list tagov — match ak ASPOŇ JEDEN tag matchuje
-      tags_all: list tagov — match LEN ak VŠETKY tagy matchujú
-      date_from / date_to: '2026-01-01' format, filter na created_at/date
-      person: meno osoby (notes → cez related_person_id, interactions → person_name)
+      tags_any: match ak ASPOŇ JEDEN tag z listu
+      tags_all: match LEN ak VŠETKY tagy
+      date_from / date_to: '2026-01-01' format
+      person: meno osoby (notes → related_person_id, interactions → person_name)
       sort: 'relevance' (BM25) | 'recent' | 'oldest'
-      limit: max počet per tabuľka (default 20)
+      limit: max per tabuľka (default 20)
 
     Príklady:
       ctx_search(person='Peter Ďurák', date_from='2026-01-01', table='interactions')
       ctx_search(category='deal-analysis', tags_all=['Q2-2026'])
       ctx_search(query='pricing', tags_any=['enterprise', '@kamil-aujesky'])
-
-    Vracia výsledky so `_snippet` (kontext s «matched» highlightom) a `_score`.
     """
     return db.search_advanced(
         query=query, table=table, domain=domain, category=category,
@@ -438,22 +464,33 @@ def ctx_search_semantic(
     limit: int = 10,
     hybrid: bool = True,
 ) -> dict:
-    """Sémantický search cez Voyage AI embeddings + sqlite-vec.
+    """SÉMANTICKÝ search cez Voyage AI embeddings (1024 dims) + RRF hybrid s BM25.
 
-    Použij pre koncepty, parafrázy, cross-language queries, "ten typ obsahu kde...".
-    Pre exact-match keywords stačí ctx_find / ctx_search.
+    KEDY POUŽIŤ:
+      ✅ Concept query / parafráza / "find anything related to X"
+      ✅ Cross-language (SK query nájde EN dokumenty a naopak)
+      ✅ Keď nepamätáš presné slová, len konceptzy / tému
+      ✅ DEFAULT pre exploratívne queries — hybrid mode kombinuje aj BM25, takže funguje aj pre keywords
+
+    KEDY POUŽIŤ INÉ:
+      ❌ Poznáš presné meno → ctx_person/ctx_company/ctx_project (rýchlejšie, deterministické)
+      ❌ Štruktúrované filtre (date, category, tags) → ctx_search
+      ❌ Quick keyword bez API call → ctx_find
+      ❌ "Find similar to this record" → ctx_find_similar
+
+    Cost: ~$0.0001 per query, latency ~200ms.
 
     PRÍKLADY:
-      ctx_search_semantic("frustrácia s deadlinom") — nájde aj "stres pred odovzdávkou", "tlak"
+      ctx_search_semantic("frustrácia s deadlinom") — nájde aj "stres pred odovzdávkou"
       ctx_search_semantic("hiring senior dev", table="notes") — nájde aj "recruiting CTO"
-      ctx_search_semantic("Q2 priority", hybrid=True) — semantic + BM25 fused
+      ctx_search_semantic("Q2 priority focus") — semantic + BM25 fused = top relevance
 
     Args:
-      query: free-text query (slovenčina aj angličtina)
+      query: free-text (slovenčina aj angličtina)
       table: 'notes' | 'interactions' | 'people' | 'companies' | 'projects' | None (všetko)
       limit: max results per table
-      hybrid: True (default) → kombinuje s FTS5 BM25 cez Reciprocal Rank Fusion (lepšie precision+recall).
-              False → čistý semantic.
+      hybrid: True (default) → kombinuje semantic + FTS5 BM25 cez Reciprocal Rank Fusion.
+              False → čistý semantic (pre extreme concept queries kde keywords sú irelevantné).
 
     Returns: results per table s `_semantic_score`, `_bm25_score`, `_fused_score`, `_snippet`.
     """

@@ -263,12 +263,25 @@ Ak si nie si istý → použi "work" pre pracovné, "personal" pre ostatné.
 
 ### Vyhľadávanie (read-only, bezpečné volať kedykoľvek)
 
+**Search Decision Tree** — vyber správny tool podľa typu otázky:
+
+| Situácia | Tool | Prečo |
+|----------|------|-------|
+| Pred písaním emailu / správy | `ctx_context("meno")` | Vráti formality, tón, jazyk, pravidlá. **POVINNÉ pred komunikáciou.** |
+| Poznám presné meno osoby/firmy/projektu | `ctx_person` / `ctx_company` / `ctx_project` | Najrýchlejšie, deterministické, $0 |
+| **Concept query** ("AI agenty", "frustrácia s deadline"), parafrázy, cross-language SK↔EN | `ctx_search_semantic(query)` | Voyage embeddings + RRF hybrid s BM25. **Default pre exploratívne queries.** ~$0.0001/query, ~200ms |
+| **Štruktúrované filtre** (date range, category, tags, osoba ako filter) | `ctx_search(filters)` | Presné DB filtrovanie, žiadne embeddings nutné |
+| "Nájdi mi podobné notes/ľudí k tomuto" | `ctx_find_similar(table, id)` | Nearest neighbors v embedding space |
+| Quick keyword lookup (chcem rýchlo, žiadny API call) | `ctx_find(query)` | BM25 lexical, $0, <50ms |
+
+Tieto tools sa **nenahradzajú** — `ctx_search_semantic` je default pre "find anything related", ale pre exact mená je `ctx_person` rýchlejší a presnejší. Pre Q2 priorities by si volal `ctx_search(category='priority', tags_all=['Q2-2026'])` namiesto semantic, lebo máš presné filtre.
+
 | Tool | Kedy | Čo vráti |
 |------|------|----------|
-| `ctx_find(query, domain?)` | Hľadáš čokoľvek | Výsledky zo všetkých tabuliek (hľadá aj v aliasoch a prezývkach). Notes a interactions vracajú `_snippet` s «match» highlightom + `_score` (BM25) |
-| `ctx_search(query?, table?, domain?, category?, tags_any?, tags_all?, date_from?, date_to?, person?, sort?)` | Štruktúrovaný search s filtrami | Použij keď ctx_find vráti príliš veľa, alebo hľadáš v konkrétnom časovom rozsahu / podľa osoby / kategórie |
-| `ctx_search_semantic(query, table?, limit?, hybrid?)` | **Sémantický search** cez Voyage AI embeddings + sqlite-vec | Pre koncepty, parafrázy, cross-language ("frustrácia s deadline" → nájde aj "stres pred odovzdávkou"). hybrid=True (default) kombinuje s BM25 cez RRF. Pre exact-match keywords stačí ctx_find. |
-| `ctx_find_similar(table, record_id, limit?, cross_table?)` | "Nájdi podobné" cez embedding similarity | "Aké iné notes sú podobné tejto?", "Aké meetingy sú podobné?", cross_table=True hľadá naprieč všetkými embeddable tabuľkami |
+| `ctx_find(query, domain?)` | Quick lexical lookup | BM25 results s `_snippet` + `_score`, naprieč všetkými tabuľkami |
+| `ctx_search(query?, table?, domain?, category?, tags_any?, tags_all?, date_from?, date_to?, person?, sort?)` | Štruktúrované filtre | Filtrované rows s `_snippet` + `_score` |
+| `ctx_search_semantic(query, table?, limit?, hybrid?)` | **Sémantický search** | Voyage embeddings, vracia `_semantic_score`, `_bm25_score`, `_fused_score`, `_snippet` |
+| `ctx_find_similar(table, record_id, limit?, cross_table?)` | Nearest neighbors k existujúcemu recordu | Records s `_similarity` score (0-1) |
 | `ctx_categories()` | Pred ctx_add_note ak nevieš akú category | Plný zoznam povolených category, domains, channels, sentiments + aliasy |
 | `ctx_context(query)` | **PRED emailom/správou** | Formality, tón, jazyk, firma, interakcie, pravidlá |
 | `ctx_person(query)` | Potrebuješ detail osoby | Údaje + interakcie + projekty + pravidlá + action items + meetingy. Podporuje prezývky ("Samo" → "Samuel") a fuzzy matching priezvisk ("Schovajsa" → "Skovajsa") |
