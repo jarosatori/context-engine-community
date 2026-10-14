@@ -63,13 +63,19 @@ def create_app():
 
     oauth_pass = os.environ.get("CTX_OAUTH_PASS")
     oauth_user = os.environ.get("CTX_OAUTH_USER", "satori")
-    server_url = os.environ.get("CTX_SERVER_URL",
-                                "https://unique-healing-production-7a14.up.railway.app")
+    server_url = os.environ.get("CTX_SERVER_URL")
+    if not server_url and os.environ.get("RAILWAY_PUBLIC_DOMAIN"):
+        server_url = f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}"
     api_key = os.environ.get("CTX_API_KEY", oauth_pass)
 
     if not oauth_pass:
         print("ERROR: CTX_OAUTH_PASS required", file=sys.stderr)
         sys.exit(1)
+    if not server_url:
+        print("ERROR: CTX_SERVER_URL required (e.g. https://your-instance.up.railway.app)",
+              file=sys.stderr)
+        sys.exit(1)
+    server_url = server_url.rstrip("/")
 
     # ── OAuth routes ──────────────────────────────────────────
     auth_settings = SimpleAuthSettings(
