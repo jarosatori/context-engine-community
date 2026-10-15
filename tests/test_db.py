@@ -256,3 +256,178 @@ class TestScanManagement:
     def test_update_scan_stats(self, tmp_db):
         result = db.update_scan_stats("gmail", 100, 5, 3, "Test scan", db_path=tmp_db)
         assert result["status"] == "ok"
+
+
+class TestBulkImport:
+    def test_import_people(self, tmp_db):
+        data = {
+            "people": [
+                {"name": "Import Test 1", "email": "import1@test.sk", "domain": "work"},
+                {"name": "Import Test 2", "email": "import2@test.sk", "role": "CTO"},
+            ]
+        }
+        result = db.bulk_import(data, db_path=tmp_db)
+        assert result["status"] == "ok"
+        assert result["total_added"] == 2
+        assert result["tables"]["people"]["added"] == 2
+
+        stats = db.stats(db_path=tmp_db)
+        assert stats["people"]["total"] == 2
+
+    def test_import_companies_and_people(self, tmp_db):
+        data = {
+            "companies": [
+                {"name": "Firma A", "type": "klient", "domain": "work"},
+                {"name": "Firma B", "type": "partner"},
+            ],
+            "people": [
+                {"name": "Clovek A", "company_name": "Firma A"},
+                {"name": "Clovek B", "company_name": "Firma B", "email": "b@test.sk"},
+            ],
+        }
+        result = db.bulk_import(data, db_path=tmp_db)
+        assert result["status"] == "ok"
+        assert result["total_added"] == 4
+        assert result["tables"]["companies"]["added"] == 2
+        assert result["tables"]["people"]["added"] == 2
+
+    def test_import_skip_duplicates(self, tmp_db):
+        db.add_record("people", {"name": "Existujuci", "email": "exist@test.sk"}, tmp_db)
+
+        data = {
+            "people": [
+                {"name": "Existujuci", "email": "exist@test.sk"},
+                {"name": "Novy Clovek", "email": "novy@test.sk"},
+            ]
+        }
+        result = db.bulk_import(data, on_duplicate="skip", db_path=tmp_db)
+        assert result["status"] == "ok"
+        assert result["total_added"] == 1
+        assert result["total_skipped"] == 1
+        assert result["tables"]["people"]["skipped"] == 1
+
+    def test_import_update_duplicates(self, tmp_db):
+        db.add_record("people", {"name": "Update Me", "email": "update@test.sk", "role": "Junior"}, tmp_db)
+
+        data = {
+            "people": [
+                {"name": "Update Me", "email": "update@test.sk", "role": "Senior"},
+            ]
+        }
+        result = db.bulk_import(data, on_duplicate="update", db_path=tmp_db)
+        assert result["status"] == "ok"
+        assert result["total_updated"] == 1
+
+        person = db.get_person("Update Me", db_path=tmp_db)
+        assert person["role"] == "Senior"
+
+    def test_import_notes(self, tmp_db):
+        data = {
+            "notes": [
+                {"title": "Poznamka 1", "content": "Obsah 1", "domain": "home", "category": "reference"},
+                {"title": "Poznamka 2", "content": "Obsah 2", "domain": "health"},
+            ]
+        }
+        result = db.bulk_import(data, db_path=tmp_db)
+        assert result["status"] == "ok"
+        assert result["tables"]["notes"]["added"] == 2
+
+    def test_import_rules(self, tmp_db):
+        data = {
+            "rules": [
+                {"context": "Email klientom", "rule": "Vzdy vykat", "priority": "high"},
+                {"context": "Slack tim", "rule": "Tykat", "priority": "low"},
+            ]
+        }
+        result = db.bulk_import(data, db_path=tmp_db)
+        assert result["status"] == "ok"
+        assert result["tables"]["rules"]["added"] == 2
+
+    def test_import_projects_and_products(self, tmp_db):
+        data = {
+            "projects": [
+                {"name": "Projekt Alpha", "description": "Test projekt", "domain": "work"},
+            ],
+            "products": [
+                {"name": "Produkt X", "price": "99 EUR", "format": "digitalny"},
+            ],
+        }
+        result = db.bulk_import(data, db_path=tmp_db)
+        assert result["status"] == "ok"
+        assert result["tables"]["projects"]["added"] == 1
+        assert result["tables"]["products"]["added"] == 1
+
+    def test_import_unknown_table(self, tmp_db):
+        data = {"evil_table": [{"name": "hack"}]}
+        result = db.bulk_import(data, db_path=tmp_db)
+        assert result["status"] == "error"
+        assert "Unknown tables" in result["error"]
+
+    def test_import_invalid_records(self, tmp_db):
+        data = {
+            "people": [
+                "not a dict",
+                {"name": "Valid Person"},
+                {"email": "no-name@test.sk"},  # missing required 'name'
+            ]
+        }
+        result = db.bulk_import(data, db_path=tmp_db)
+        assert result["status"] == "ok"
+        assert result["tables"]["people"]["added"] == 1
+        assert result["tables"]["people"]["errors"] == 2
+
+    def test_import_empty(self, tmp_db):
+        result = db.bulk_import({}, db_path=tmp_db)
+        assert result["status"] == "ok"
+        assert result["total_added"] == 0
+
+    def test_import_strips_readonly_fields(self, tmp_db):
+        """Import should ignore id, created_at, first_seen, updated_at from export data."""
+        data = {
+            "people": [
+                {
+                    "id": 999,
+                    "name": "Stripped Fields",
+                    "email": "stripped@test.sk",
+                    "created_at": "2020-01-01",
+                    "first_seen": "2020-01-01",
+                    "updated_at": "2020-01-01",
+                },
+            ]
+        }
+        result = db.bulk_import(data, db_path=tmp_db)
+        assert result["status"] == "ok"
+        assert result["total_added"] == 1
+
+        person = db.get_person("Stripped Fields", db_path=tmp_db)
+        assert person["id"] != 999  # ID should be auto-assigned
+
+    def test_import_roundtrip_with_export(self, tmp_db):
+        """Data exported via ctx_export should be importable via ctx_import."""
+        # Seed some data
+        db.add_record("companies", {"name": "Roundtrip Co", "type": "klient"}, tmp_db)
+        db.add_record("people", {"name": "Roundtrip Person", "email": "rt@test.sk", "company_name": "Roundtrip Co"}, tmp_db)
+        db.add_record("rules", {"context": "Test", "rule": "Test rule"}, tmp_db)
+        db.add_note({"title": "Test Note", "content": "content"}, tmp_db)
+
+        # Export
+        exported = db.export_data(db_path=tmp_db)
+        assert len(exported["people"]) == 1
+        assert len(exported["companies"]) == 1
+
+        # Import into fresh DB
+        import tempfile
+        fd2, path2 = tempfile.mkstemp(suffix=".db")
+        os.close(fd2)
+        try:
+            db.init_db(path2)
+            result = db.bulk_import(exported, db_path=path2)
+            assert result["status"] == "ok"
+            assert result["total_added"] >= 3  # company + person + rule + note
+
+            stats = db.stats(db_path=path2)
+            assert stats["companies"]["total"] == 1
+            assert stats["people"]["total"] == 1
+            assert stats["rules"]["total"] == 1
+        finally:
+            os.unlink(path2)
