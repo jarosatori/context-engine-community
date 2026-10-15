@@ -8,8 +8,9 @@ version = "0.1.0"
 description = "Strukturovana kontextova pamat — MCP server pre Life OS"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.0",
+    "mcp>=1.0,<2",
     "pydantic>=2.0",
+    "pydantic-settings>=2.0",
     "mcp-oauth>=0.0.6",
     "sqlite-vec>=0.1.6",
     "voyageai>=0.3.2",
